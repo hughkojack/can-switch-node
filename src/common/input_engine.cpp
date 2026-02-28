@@ -145,8 +145,8 @@ void input_engine_process_level(uint8_t input_id, bool active_now) {
 void input_engine_update(void) {
   unsigned long now = millis();
   
-  // Check all inputs for pending click timeouts
-  for (uint8_t i = 0; i < 256; i++) {
+  // Check all inputs for pending click timeouts (use int so loop terminates at 256)
+  for (int i = 0; i < 256; i++) {
     input_state_t* state = &g_state[i];
     if (state->click_pending && (now - state->pending_click_time) > (unsigned long)g_double_click_gap_ms) {
       // Find config to verify this input is valid

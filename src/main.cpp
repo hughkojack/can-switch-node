@@ -107,6 +107,8 @@ static inline uint8_t getNodeId(uint32_t canId) {
   return (uint8_t)(canId & 0x7F);
 }
 
+static void can_poll_task(void* arg);  // forward decl for setup()
+
 // ---- helpers to send commands to the LED controller hub ----
 static bool can_send_set_brightness(uint8_t output, uint8_t brightness_0_100, uint16_t fade_ms) {
   twai_message_t tx{};
@@ -180,6 +182,13 @@ void lvgl_port_lock(int timeout_ms)
 {
     const TickType_t timeout_ticks = (timeout_ms < 0) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
     xSemaphoreTakeRecursive(lvgl_mux, timeout_ticks);
+}
+
+// Returns true if lock was acquired, false if timeout. Caller must only call lvgl_port_unlock() if true.
+bool lvgl_port_lock_with_timeout(int timeout_ms)
+{
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+    return xSemaphoreTakeRecursive(lvgl_mux, timeout_ticks) == pdTRUE;
 }
 
 void lvgl_port_unlock(void)
@@ -329,6 +338,8 @@ void setup()
 #else
     can_send_node_announce(cfg.node_id, NODE_TYPE_LCD, cfg.input_count);
 #endif
+
+    xTaskCreate(can_poll_task, "can_poll", 12288, NULL, 1, NULL);
 }
 
 void handle_can_messages() {
@@ -337,7 +348,6 @@ void handle_can_messages() {
 
     if (status.msgs_to_rx > 0) {
         if (CAN.read(&message) == ESP_OK) {
-
             // Handle hub -> node config (addressed to this node or unconfigured)
             uint8_t msg_type = (uint8_t)((message.identifier >> 7) & 0x0F);
             uint8_t target_id = (uint8_t)(message.identifier & 0x7F);
@@ -415,28 +425,34 @@ void handle_can_messages() {
                      message.data[2]);
 
             
-            // Thread-safe UI update
-            lvgl_port_lock(-1); 
-            if (ui_CanStatusLabel != NULL) {
-                lv_label_set_text(ui_CanStatusLabel, buf);
+            // Thread-safe UI update (timeout to avoid blocking forever and triggering watchdog)
+            if (lvgl_port_lock_with_timeout(50)) {
+                if (ui_CanStatusLabel != NULL) {
+                    lv_label_set_text(ui_CanStatusLabel, buf);
+                }
+                lvgl_port_unlock();
             }
-            lvgl_port_unlock();
         }
     }
 }
 
-void loop() {
-    // Turn off find-me output after duration
-    if (find_me_until && millis() >= find_me_until) {
-        find_me_until = 0;
-        if (g_expander)
-            g_expander->digitalWrite(LCD_BL, LOW);
+// Dedicated task to poll CAN and input engine so it runs even if Arduino loop() is starved by LVGL
+static void can_poll_task(void* arg) {
+    vTaskDelay(pdMS_TO_TICKS(500));  // Let system stabilize after boot
+    for (;;) {
+        handle_can_messages();
+        input_engine_update();
+        // Turn off find-me output after duration
+        if (find_me_until && millis() >= find_me_until) {
+            find_me_until = 0;
+            if (g_expander)
+                g_expander->digitalWrite(LCD_BL, LOW);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
+}
 
-    handle_can_messages(); // Constantly check for new data
-    
-    // Update input engine to check for pending click timeouts
-    input_engine_update();
-    
-    delay(10);
+void loop() {
+    // CAN polling and input engine run in can_poll_task
+    delay(100);
 }
