@@ -8,10 +8,13 @@
 extern "C" {
 #endif
 
+// Match hub: max inputs per node 1..6
+#define MAX_INPUTS_PER_NODE 6
+
 typedef struct {
   uint8_t node_id;
-  uint8_t input_count;
-  input_cfg_t inputs[16];   // up to 16 inputs; gang 1..6 for mechanical
+  uint8_t input_count;   // 1..MAX_INPUTS_PER_NODE
+  input_cfg_t inputs[MAX_INPUTS_PER_NODE];
 } node_config_t;
 
 // Load config from NVS; if not found, provide defaults (node_id = NODE_ID_UNCONFIGURED, etc.)
@@ -20,7 +23,7 @@ bool config_load(node_config_t* out_cfg);
 // Save config to NVS
 bool config_save(const node_config_t* cfg);
 
-// Find-me output index (stored in NVS; which GPIO/LED to drive for CMD_FIND_ME)
+// Find-me: I/O index = ESP32-S3 chip I/O (GPIO number 0-48). Independent of input count (1-6).
 bool config_get_find_me_output(uint8_t* out_index);
 bool config_set_find_me_output(uint8_t index);
 

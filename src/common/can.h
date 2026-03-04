@@ -16,11 +16,11 @@ extern "C" {
 
 // Config sub-commands (payload byte 0 when CAN_MSG_NODE_CONFIG)
 #define CMD_SET_NODE_ID        0x01
-#define CMD_SET_INPUT_CFG     0x02  // input_index, input_id, mode (momentary/toggle)
-#define CMD_SET_INPUT_COUNT   0x03  // count 1..6
-#define CMD_SET_TIMING        0x04  // optional: click_max, dbl_gap, hold_min, long_hold (e.g. 4x uint16_t)
-#define CMD_FIND_ME           0x05  // optional duration byte: drive find-me output for N seconds
-#define CMD_SET_FIND_ME_OUTPUT 0x06 // output_index -> store in NVS
+#define CMD_SET_INPUT_CFG      0x02  // payload: [input_index 0..5, input_id, mode]; mode 0=momentary 1=toggle
+#define CMD_SET_INPUT_COUNT    0x03  // payload: [count]; count 1..6 (hub and node aligned)
+#define CMD_SET_TIMING         0x04  // optional: click_max, dbl_gap, hold_min, long_hold (e.g. 4x uint16_t)
+#define CMD_FIND_ME            0x05  // payload: [duration_min]; drive find-me output for N minutes (1-30)
+#define CMD_SET_FIND_ME_OUTPUT  0x06  // payload: [output_index]; store in NVS for find-me blink
 
 // Node types for announce (payload byte 0)
 #define NODE_TYPE_LCD        1

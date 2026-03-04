@@ -29,10 +29,10 @@ This document describes the CAN frame layout and commands so hub firmware (and w
 | Cmd | Name | Payload | Description |
 |-----|------|---------|-------------|
 | 0x01 | CMD_SET_NODE_ID | `[0x01, new_id]` | Set node ID (1..126). Node saves to NVS and re-inits. |
-| 0x02 | CMD_SET_INPUT_CFG | `[0x02, input_index, input_id, mode]` | Per-input config: input_index 0..15, mode 0=momentary 1=toggle. |
-| 0x03 | CMD_SET_INPUT_COUNT | `[0x03, count]` | Gang count: mechanical 1..6, LCD 1..16. |
+| 0x02 | CMD_SET_INPUT_CFG | `[0x02, input_index, input_id, mode]` | Per-input config: **input_index 0..5**, **mode 0=momentary 1=toggle**. |
+| 0x03 | CMD_SET_INPUT_COUNT | `[0x03, count]` | **Count 1..6** (hub and node aligned). |
 | 0x04 | CMD_SET_TIMING | `[0x04, click_max_lo, click_max_hi, dbl_gap_lo, dbl_gap_hi, hold_lo, hold_hi, long_lo, long_hi]` | 4× uint16 little-endian: click_max_ms, double_click_gap_ms, hold_min_ms, long_hold_min_ms. |
-| 0x05 | CMD_FIND_ME | `[0x05, duration_sec]` | Drive find-me output for N seconds (default 5). Optional byte 1 = seconds. |
+| 0x05 | CMD_FIND_ME | `[0x05, duration_min]` | Drive find-me output for **N minutes** (1–30). Byte 1 = duration in minutes. |
 | 0x06 | CMD_SET_FIND_ME_OUTPUT | `[0x06, output_index]` | Set which output index to use for find-me (stored in NVS). |
 
 ## Node → Hub: CAN_MSG_NODE_ANNOUNCE (0x8)
@@ -40,7 +40,7 @@ This document describes the CAN frame layout and commands so hub firmware (and w
 - **ID**: `(0x8 << 7) | node_id` (127 when unconfigured).
 - **Payload**: `[ node_type, input_count ]`
   - **node_type**: 1 = LCD, 2 = mechanical.
-  - **input_count**: 1..16 (mechanical typically 1..6).
+  - **input_count**: **1..6** (hub and node aligned).
 
 ## Node types
 
@@ -49,8 +49,9 @@ This document describes the CAN frame layout and commands so hub firmware (and w
 
 ## Find-me output
 
-- Output is identified by an **output index** stored in NVS (set via `CMD_SET_FIND_ME_OUTPUT`).
-- Board-specific mapping (e.g. index 0 = LCD backlight on expander). Hub/documentation defines mapping per board.
+- **Find Me I/O index** = **ESP32-S3 chip I/O** (GPIO number 0–48). Not related to the number of inputs (1–6).
+- Stored in NVS via `CMD_SET_FIND_ME_OUTPUT`. When Find Me runs, the node drives that GPIO (solid on for index 0, blinked for others).
+- Choose a GPIO that is free on your board (e.g. not used by CAN, I2C, or display).
 
 ## Constants (match `can.h`)
 

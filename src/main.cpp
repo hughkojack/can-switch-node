@@ -91,11 +91,14 @@ SemaphoreHandle_t lvgl_mux = NULL;                  // LVGL mutex
 
 static node_config_t cfg;
 
-// For find-me: expander set in setup so we can drive output by index (e.g. 0 = LCD_BL)
+// For find-me: I/O index = ESP32-S3 chip I/O (GPIO number), independent of input count (1-6).
 static ESP_IOExpander* g_expander = nullptr;
 static unsigned long find_me_until = 0;   // millis() when to turn find-me output off
-static uint8_t find_me_output_index = 0;  // cached from NVS
+static uint8_t find_me_output_index = 0;  // cached from NVS: GPIO number (0-48)
 static input_timing_t s_timing;            // timing from NVS, passed to input_engine
+
+// Find Me I/O index = ESP32-S3 GPIO number (0-48). Use a GPIO that is free on your board (not used by CAN, I2C, etc.).
+#define FIND_ME_GPIO_MAX 48
 
 static inline uint16_t createCanId(CanMessageType msgType, uint8_t nodeId) {
   return ((uint16_t)msgType << 7) | (nodeId & 0x7F);
@@ -364,7 +367,7 @@ void handle_can_messages() {
                     }
                 } else if (cmd == CMD_SET_INPUT_CFG && message.data_length_code >= 4) {
                     uint8_t idx = message.data[1];
-                    if (idx < 16) {
+                    if (idx < MAX_INPUTS_PER_NODE) {
                         cfg.inputs[idx].input_id = message.data[2];
                         cfg.inputs[idx].mode = (input_mode_t)(message.data[3] & 1);
                         config_save(&cfg);
@@ -374,12 +377,7 @@ void handle_can_messages() {
                     }
                 } else if (cmd == CMD_SET_INPUT_COUNT && message.data_length_code >= 2) {
                     uint8_t n = message.data[1];
-#if defined(NODE_ROLE_MIN)
-                    if (n >= 1 && n <= 6)
-#else
-                    if (n >= 1 && n <= 16)
-#endif
-                    {
+                    if (n >= 1 && n <= 6) {
                         cfg.input_count = n;
                         config_save(&cfg);
                         config_get_timing(&s_timing);
@@ -395,16 +393,20 @@ void handle_can_messages() {
                     input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
                     Serial.printf("CONFIG: timing updated\n");
                 } else if (cmd == CMD_FIND_ME) {
-                    uint8_t duration_sec = (message.data_length_code >= 2) ? message.data[1] : 5;
-                    if (duration_sec == 0) duration_sec = 5;
+                    uint8_t duration_min = (message.data_length_code >= 2) ? message.data[1] : 5;
+                    if (duration_min == 0) duration_min = 5;
                     config_get_find_me_output(&find_me_output_index);
-                    if (g_expander) {
-                        // Board-specific: index 0 = LCD_BL on expander
-                        if (find_me_output_index == 0)
-                            g_expander->digitalWrite(LCD_BL, HIGH);
+                    if (find_me_output_index <= FIND_ME_GPIO_MAX) {
+                        uint8_t gpio = find_me_output_index;
+                        pinMode(gpio, OUTPUT);
+                        if (gpio == 0) {
+                            // Index 0 = solid on for duration
+                            digitalWrite(gpio, HIGH);
+                        }
+                        // Non-zero: poll task will blink
                     }
-                    find_me_until = millis() + (unsigned long)duration_sec * 1000;
-                    Serial.printf("CONFIG: find-me on for %u s (output_index=%u)\n", (unsigned)duration_sec, (unsigned)find_me_output_index);
+                    find_me_until = millis() + (unsigned long)duration_min * 60 * 1000;
+                    Serial.printf("CONFIG: find-me on for %u min (GPIO=%u)\n", (unsigned)duration_min, (unsigned)find_me_output_index);
                 } else if (cmd == CMD_SET_FIND_ME_OUTPUT && message.data_length_code >= 2) {
                     config_set_find_me_output(message.data[1]);
                     config_get_find_me_output(&find_me_output_index);
@@ -439,14 +441,48 @@ void handle_can_messages() {
 // Dedicated task to poll CAN and input engine so it runs even if Arduino loop() is starved by LVGL
 static void can_poll_task(void* arg) {
     vTaskDelay(pdMS_TO_TICKS(500));  // Let system stabilize after boot
+    
+    // Track last HEARTBEAT send time for periodic announcements
+    static unsigned long last_heartbeat_ms = 0;
+    // Find-me blink: last toggle time (0 = not started this run) and current state
+    static unsigned long find_me_last_toggle_ms = 0;
+    static bool find_me_blink_high = false;
+    
+    const unsigned long FIND_ME_BLINK_INTERVAL_MS = 150;
+    
+    // Determine node type (same logic as setup())
+    uint8_t node_type;
+#if defined(NODE_ROLE_LCD)
+    node_type = NODE_TYPE_LCD;
+#elif defined(NODE_ROLE_MIN)
+    node_type = NODE_TYPE_MECHANICAL;
+#else
+    node_type = NODE_TYPE_LCD;  // default
+#endif
+    
     for (;;) {
         handle_can_messages();
         input_engine_update();
-        // Turn off find-me output after duration
-        if (find_me_until && millis() >= find_me_until) {
+        
+        // Send periodic HEARTBEAT every 15 seconds
+        unsigned long now_ms = millis();
+        if (now_ms - last_heartbeat_ms >= 15000) {
+            can_send_node_announce(cfg.node_id, node_type, cfg.input_count);
+            last_heartbeat_ms = now_ms;
+        }
+        
+        // Find-me: turn off after duration, or blink for non-zero I/O index (ESP32-S3 GPIO)
+        if (find_me_until && now_ms >= find_me_until) {
+            if (find_me_output_index <= FIND_ME_GPIO_MAX)
+                digitalWrite(find_me_output_index, LOW);
             find_me_until = 0;
-            if (g_expander)
-                g_expander->digitalWrite(LCD_BL, LOW);
+            find_me_last_toggle_ms = 0;
+        } else if (find_me_until && find_me_output_index != 0 && find_me_output_index <= FIND_ME_GPIO_MAX) {
+            if (find_me_last_toggle_ms == 0 || (now_ms - find_me_last_toggle_ms) >= FIND_ME_BLINK_INTERVAL_MS) {
+                find_me_blink_high = !find_me_blink_high;
+                digitalWrite(find_me_output_index, find_me_blink_high ? HIGH : LOW);
+                find_me_last_toggle_ms = now_ms;
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }

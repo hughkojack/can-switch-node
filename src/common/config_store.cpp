@@ -45,12 +45,9 @@ bool config_load(node_config_t* out_cfg) {
     return true;
   }
 
-  // Clamp input_count for safety (e.g. mechanical 1..6)
-  if (out_cfg->input_count > 16) out_cfg->input_count = 16;
-#if defined(NODE_ROLE_MIN)
-  if (out_cfg->input_count > 6) out_cfg->input_count = 6;
+  // Clamp input_count to hub range 1..6
+  if (out_cfg->input_count > MAX_INPUTS_PER_NODE) out_cfg->input_count = MAX_INPUTS_PER_NODE;
   if (out_cfg->input_count < 1) out_cfg->input_count = 1;
-#endif
   return true;
 }
 
