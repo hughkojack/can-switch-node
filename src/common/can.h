@@ -9,6 +9,7 @@ extern "C" {
 // ---- CAN Protocol ----
 #define CAN_MSG_INPUT_EVENT   0x1
 #define CAN_MSG_NODE_CONFIG   0x3   // Hub -> node: configuration
+#define CAN_MSG_STATE_FEEDBACK 0x4  // Hub -> node: per-button brightness [b1,b2,b3,b4] 0-100 or 0xFF
 #define CAN_MSG_NODE_ANNOUNCE 0x8   // Node -> hub: heartbeat/announce (reuse HEARTBEAT type)
 
 // Unconfigured node ID (127): hub detects new nodes; valid configured IDs 1..126
@@ -21,6 +22,7 @@ extern "C" {
 #define CMD_SET_TIMING         0x04  // optional: click_max, dbl_gap, hold_min, long_hold (e.g. 4x uint16_t)
 #define CMD_FIND_ME            0x05  // payload: [duration_min]; drive find-me output for N minutes (1-30)
 #define CMD_SET_FIND_ME_OUTPUT  0x06  // payload: [output_index]; store in NVS for find-me blink
+#define CMD_SET_INPUT_LABEL     0x07  // payload: [input_index, total_len|0xFF, c0..c5]; multi-frame for len>6
 
 // Node types for announce (payload byte 0)
 #define NODE_TYPE_LCD        1
@@ -34,6 +36,7 @@ typedef enum {
   EVT_TRIPLE_CLICK = 0x04,
   EVT_LONG_HOLD    = 0x05,
   EVT_HOLD_REPEAT  = 0x06,
+  EVT_DIM          = 0x07,  // payload byte 2 = brightness 0..100
 } can_input_event_code_t;
 
 // Build 11-bit ID: (msgType<<7) | (nodeId&0x7F)
@@ -49,6 +52,7 @@ bool can_send_triple_click(uint8_t node_id, uint8_t input_id);
 bool can_send_hold(uint8_t node_id, uint8_t input_id);
 bool can_send_long_hold(uint8_t node_id, uint8_t input_id);
 bool can_send_hold_repeat(uint8_t node_id, uint8_t input_id);
+bool can_send_dim(uint8_t node_id, uint8_t input_id, uint8_t brightness_0_100);
 
 // Node -> hub: announce/heartbeat (node_id, type, input_count) so hub can detect new nodes
 bool can_send_node_announce(uint8_t node_id, uint8_t node_type, uint8_t input_count);

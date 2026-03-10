@@ -15,6 +15,7 @@ static const uint16_t DEFAULT_LONG_HOLD_MIN_MS = 2000;
 
 static void apply_defaults(node_config_t* out_cfg) {
   out_cfg->node_id = NODE_ID_UNCONFIGURED;
+  memset(out_cfg->input_labels, 0, sizeof(out_cfg->input_labels));
 #if defined(NODE_ROLE_MIN)
   out_cfg->input_count = 1;
   out_cfg->inputs[0] = { 1, INPUT_MODE_TOGGLE };
@@ -28,6 +29,9 @@ static void apply_defaults(node_config_t* out_cfg) {
 #endif
 }
 
+// Size of node_config_t before input_labels was added (for NVS backward compatibility)
+#define OLD_NODE_CONFIG_SIZE  (sizeof(uint8_t) * 2 + sizeof(input_cfg_t) * MAX_INPUTS_PER_NODE)
+
 bool config_load(node_config_t* out_cfg) {
   if (!out_cfg) return false;
 
@@ -40,6 +44,13 @@ bool config_load(node_config_t* out_cfg) {
   size_t len = prefs.getBytes(NVS_KEY_CFG, out_cfg, sizeof(node_config_t));
   prefs.end();
 
+  if (len == OLD_NODE_CONFIG_SIZE) {
+    // Old NVS layout: zero labels and use the rest
+    memset(out_cfg->input_labels, 0, sizeof(out_cfg->input_labels));
+    if (out_cfg->input_count > MAX_INPUTS_PER_NODE) out_cfg->input_count = MAX_INPUTS_PER_NODE;
+    if (out_cfg->input_count < 1) out_cfg->input_count = 1;
+    return true;
+  }
   if (len != sizeof(node_config_t)) {
     apply_defaults(out_cfg);
     return true;

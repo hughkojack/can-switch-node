@@ -48,6 +48,11 @@ bool can_send_hold_repeat(uint8_t node_id, uint8_t input_id) {
   return can_send_raw(can_id(CAN_MSG_INPUT_EVENT, node_id), d, 2);
 }
 
+bool can_send_dim(uint8_t node_id, uint8_t input_id, uint8_t brightness_0_100) {
+  uint8_t d[3] = { input_id, (uint8_t)EVT_DIM, brightness_0_100 };
+  return can_send_raw(can_id(CAN_MSG_INPUT_EVENT, node_id), d, 3);
+}
+
 bool can_send_node_announce(uint8_t node_id, uint8_t node_type, uint8_t input_count) {
   uint8_t d[2] = { node_type, input_count };
   return can_send_raw(can_id(CAN_MSG_NODE_ANNOUNCE, node_id), d, 2);

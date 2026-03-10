@@ -79,7 +79,7 @@ void start_ui()
 #define LVGL_TASK_MIN_DELAY_MS  (1)
 #define LVGL_TASK_STACK_SIZE    (4 * 1024)
 #define LVGL_TASK_PRIORITY      (2)
-#define LVGL_BUF_SIZE           (ESP_PANEL_LCD_H_RES * 20)
+#define LVGL_BUF_SIZE           (ESP_PANEL_LCD_H_RES * 100)
 
 lv_obj_t * ui_CanStatusLabel = NULL; // Define the label pointer
 
@@ -247,11 +247,18 @@ void setup()
 
     /* Initialize LVGL buffers */
     static lv_disp_draw_buf_t draw_buf;
-    /* Using double buffers is more faster than single buffer */
-    /* Using internal SRAM is more fast than PSRAM (Note: Memory allocated using `malloc` may be located in PSRAM.) */
-    uint8_t *buf = (uint8_t *)heap_caps_calloc(1, LVGL_BUF_SIZE * sizeof(lv_color_t), MALLOC_CAP_INTERNAL);
-    assert(buf);
-    lv_disp_draw_buf_init(&draw_buf, buf, NULL, LVGL_BUF_SIZE);
+    /* Double buffer in PSRAM (100 lines × 800 × 2 bytes × 2 buffers = 320KB; internal SRAM is too small) */
+    uint8_t *buf1 = (uint8_t *)heap_caps_calloc(1, LVGL_BUF_SIZE * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    uint8_t *buf2 = (uint8_t *)heap_caps_calloc(1, LVGL_BUF_SIZE * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    if (!buf1 || !buf2) {
+        /* Fallback: single buffer, 40 lines, in internal RAM if PSRAM unavailable */
+        buf1 = (uint8_t *)heap_caps_calloc(1, (ESP_PANEL_LCD_H_RES * 40) * sizeof(lv_color_t), MALLOC_CAP_INTERNAL);
+        buf2 = NULL;
+        lv_disp_draw_buf_init(&draw_buf, buf1, NULL, ESP_PANEL_LCD_H_RES * 40);
+    } else {
+        lv_disp_draw_buf_init(&draw_buf, buf1, buf2, LVGL_BUF_SIZE);
+    }
+    assert(buf1);
 
     /* Initialize the display device */
     static lv_disp_drv_t disp_drv;
@@ -354,7 +361,15 @@ void handle_can_messages() {
             // Handle hub -> node config (addressed to this node or unconfigured)
             uint8_t msg_type = (uint8_t)((message.identifier >> 7) & 0x0F);
             uint8_t target_id = (uint8_t)(message.identifier & 0x7F);
-            if (msg_type == CAN_MSG_NODE_CONFIG && target_id == cfg.node_id && message.data_length_code >= 1) {
+            if (msg_type == CAN_MSG_STATE_FEEDBACK && target_id == cfg.node_id && message.data_length_code >= 4) {
+#if defined(NODE_ROLE_LCD)
+                if (lvgl_port_lock_with_timeout(50)) {
+                    for (int i = 0; i < 4; i++)
+                        ui_set_feedback_brightness((uint8_t)i, message.data[i]);
+                    lvgl_port_unlock();
+                }
+#endif
+            } else if (msg_type == CAN_MSG_NODE_CONFIG && target_id == cfg.node_id && message.data_length_code >= 1) {
                 uint8_t cmd = message.data[0];
                 if (cmd == CMD_SET_NODE_ID && message.data_length_code >= 2) {
                     uint8_t new_id = message.data[1];
@@ -411,6 +426,48 @@ void handle_can_messages() {
                     config_set_find_me_output(message.data[1]);
                     config_get_find_me_output(&find_me_output_index);
                     Serial.printf("CONFIG: find-me output index set to %u\n", (unsigned)find_me_output_index);
+                } else if (cmd == CMD_SET_INPUT_LABEL && message.data_length_code >= 3) {
+                    uint8_t idx = message.data[1];
+                    uint8_t seg = message.data[2];
+                    if (idx < MAX_INPUTS_PER_NODE) {
+                        static uint8_t label_len[MAX_INPUTS_PER_NODE];
+                        static size_t label_pos[MAX_INPUTS_PER_NODE];
+                        if (seg == 0) {
+                            cfg.input_labels[idx][0] = '\0';
+                            config_save(&cfg);
+#if defined(NODE_ROLE_LCD)
+                            if (lvgl_port_lock_with_timeout(50)) {
+                                ui_refresh_labels();
+                                lvgl_port_unlock();
+                            }
+#endif
+                        } else {
+                            if (seg != 0xFF) {
+                                label_len[idx] = seg <= MAX_INPUT_LABEL_LEN ? seg : MAX_INPUT_LABEL_LEN;
+                                label_pos[idx] = 0;
+                                memset(cfg.input_labels[idx], 0, sizeof(cfg.input_labels[idx]));
+                            }
+                            size_t avail = (message.data_length_code >= 3) ? (size_t)(message.data_length_code - 3) : 0;
+                            size_t to_copy = (avail < (label_len[idx] - label_pos[idx])) ? avail : (label_len[idx] - label_pos[idx]);
+                            size_t space_left = (size_t)(MAX_INPUT_LABEL_LEN + 1) - label_pos[idx];
+                            if (to_copy > space_left) to_copy = space_left;
+                            for (size_t i = 0; i < to_copy; i++) {
+                                cfg.input_labels[idx][label_pos[idx] + i] = (char)message.data[3 + i];
+                            }
+                            label_pos[idx] += to_copy;
+                            cfg.input_labels[idx][label_pos[idx] <= MAX_INPUT_LABEL_LEN ? label_pos[idx] : MAX_INPUT_LABEL_LEN] = '\0';
+                            if (label_pos[idx] >= label_len[idx]) {
+                                config_save(&cfg);
+                                Serial.printf("CONFIG: label[%u] = '%s'\n", (unsigned)idx, cfg.input_labels[idx]);
+#if defined(NODE_ROLE_LCD)
+                                if (lvgl_port_lock_with_timeout(50)) {
+                                    ui_refresh_labels();
+                                    lvgl_port_unlock();
+                                }
+#endif
+                            }
+                        }
+                    }
                 }
                 // Continue to update display with this message if desired, or return
             }
