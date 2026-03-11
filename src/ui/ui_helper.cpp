@@ -171,12 +171,12 @@ static void create_card(lv_obj_t* parent, int i, lv_coord_t card_w, lv_coord_t c
     // Horizontal slider: left to right, stops before power/digit area; large round knob
     lv_obj_t* slider = lv_slider_create(card);
     lv_obj_set_width(slider, LV_PCT(78));  // leave right space for power icon + brightness %
-    lv_obj_set_height(slider, 36);
+    lv_obj_set_height(slider, 14);         // thin track
     lv_slider_set_range(slider, 0, 100);
     lv_slider_set_value(slider, v, LV_ANIM_OFF);
     lv_obj_set_style_radius(slider, 6, 0);
     lv_obj_set_style_bg_color(slider, lv_color_hex(0x404040), 0);
-    lv_obj_set_style_bg_color(slider, lv_color_hex(0x707070), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(0x4ade80), LV_PART_INDICATOR);  // light green fill left of knob
     lv_obj_set_style_radius(slider, 6, LV_PART_INDICATOR);
     lv_obj_set_style_width(slider, 48, LV_PART_KNOB);
     lv_obj_set_style_height(slider, 48, LV_PART_KNOB);
