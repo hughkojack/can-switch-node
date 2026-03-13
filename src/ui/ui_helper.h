@@ -7,6 +7,9 @@
 
 extern lv_obj_t * ui_CanStatusLabel;
 
+// Set CAN indicator dot: green when connected, red flashing when disconnected. Call from CAN task with LVGL lock if needed.
+void ui_set_can_connected(bool connected);
+
 // Public API
 void setup_wall_switch_ui(void);
 // Call when node config labels have been updated (e.g. after CMD_SET_INPUT_LABEL) so the UI can refresh button labels.

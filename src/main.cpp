@@ -1,4 +1,7 @@
 #include <Arduino.h>
+#include <string.h>
+#include <time.h>
+#include <sys/time.h>
 #include "common/can.h"
 #include "common/input_engine.h"
 #include "common/config_store.h"
@@ -43,10 +46,12 @@ void start_ui()
 #endif
 }
 
-#include "ESP32TWAISingleton.hpp" // This provides the global 'CAN' object
+#include "common/can_driver.h" // provides CAN (TWAI or MCP2515)
 
+#if defined(NODE_ROLE_LCD)
 #include <lvgl.h>
 #include <ESP_Panel_Library.h>
+#endif
 #include <ESP_IOExpander_Library.h>
 
 
@@ -66,25 +71,25 @@ void start_ui()
 #define CAN_GPIO_RX GPIO_NUM_19
 #define CAN_GPIO_TX GPIO_NUM_20
 
-/**
-/* To use the built-in examples and demos of LVGL uncomment the includes below respectively.
- * You also need to copy `lvgl/examples` to `lvgl/src/examples`. Similarly for the demos `lvgl/demos` to `lvgl/src/demos`.
- */
-// #include <demos/lv_demos.h>
-// #include <examples/lv_examples.h>
+#if defined(NODE_ROLE_MIN)
+// Mechanical node: Seeed XIAO ESP32-S3 + XIAO CAN Bus Expansion Board (MCP2515).
+// Expansion board CS is connected to D7 pad; on XIAO_ESP32S3 variant D7 = GPIO 44 (see pins_arduino.h).
+#ifndef CAN_CS_GPIO
+#define CAN_CS_GPIO 44
+#endif
+#endif
 
+#if defined(NODE_ROLE_LCD)
 /* LVGL porting configurations */
-#define LVGL_TICK_PERIOD_MS     (2)
 #define LVGL_TASK_MAX_DELAY_MS  (500)
 #define LVGL_TASK_MIN_DELAY_MS  (1)
 #define LVGL_TASK_STACK_SIZE    (4 * 1024)
 #define LVGL_TASK_PRIORITY      (2)
 #define LVGL_BUF_SIZE           (ESP_PANEL_LCD_H_RES * 100)
 
-lv_obj_t * ui_CanStatusLabel = NULL; // Define the label pointer
-
 ESP_Panel *panel = NULL;
 SemaphoreHandle_t lvgl_mux = NULL;                  // LVGL mutex
+#endif
 
 
 //---- helpers to send commands to the LED controller hub ----
@@ -96,6 +101,10 @@ static ESP_IOExpander* g_expander = nullptr;
 static unsigned long find_me_until = 0;   // millis() when to turn find-me output off
 static uint8_t find_me_output_index = 0;  // cached from NVS: GPIO number (0-48)
 static input_timing_t s_timing;            // timing from NVS, passed to input_engine
+
+// CAN status: dot indicator (green / red flashing) driven by s_last_can_rx_ms
+static unsigned long s_last_can_rx_ms = 0;
+#define CAN_STATUS_IDLE_MS 2500
 
 // Find Me I/O index = ESP32-S3 GPIO number (0-48). Use a GPIO that is free on your board (not used by CAN, I2C, etc.).
 #define FIND_ME_GPIO_MAX 48
@@ -113,44 +122,9 @@ static inline uint8_t getNodeId(uint32_t canId) {
 static void can_poll_task(void* arg);  // forward decl for setup()
 
 // ---- helpers to send commands to the LED controller hub ----
-static bool can_send_set_brightness(uint8_t output, uint8_t brightness_0_100, uint16_t fade_ms) {
-  twai_message_t tx{};
-  tx.identifier = createCanId(LIGHTING_COMMAND, cfg.node_id);
-  tx.flags = 0;                 // standard 11-bit frame
-  tx.data_length_code = 5;
-  tx.data[0] = SET_BRIGHTNESS;
-  tx.data[1] = output;          // 1..160
-  tx.data[2] = brightness_0_100; // 0..100
-  tx.data[3] = (uint8_t)(fade_ms & 0xFF);
-  tx.data[4] = (uint8_t)(fade_ms >> 8);
-
-  return twai_transmit(&tx, pdMS_TO_TICKS(50)) == ESP_OK;
-}
-
-// state: 0=OFF, 1=ON, 2=TOGGLE
-static bool can_send_set_state(uint8_t output, uint8_t state, uint16_t fade_ms) {
-    uint8_t data[5];
-    data[0] = SET_STATE;
-    data[1] = output;
-    data[2] = state;
-    data[3] = (uint8_t)(fade_ms & 0xFF);
-    data[4] = (uint8_t)(fade_ms >> 8);
-
-    uint32_t can_id = createCanId(LIGHTING_COMMAND, cfg.node_id);
-
-    // 3. Use the library's write function via the Singleton
-    // Parameters: FrameType, Identifier, Data Length, Data Buffer
-    esp_err_t result = CAN.write(
-        can::FrameType::STD_FRAME, 
-        can_id, 
-        5, 
-        data
-
-    );
-    return (result == ESP_OK);
-}  
 
 
+#if defined(NODE_ROLE_LCD)
 // This function will be called by the panel when it's ready to flush the next frame (after the previous one is done)
 /* Display flushing */
 void lvgl_port_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p)
@@ -218,6 +192,7 @@ void lvgl_port_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(task_delay_ms));
     }
 }
+#endif // NODE_ROLE_LCD
 
 
 void setup()
@@ -226,14 +201,14 @@ void setup()
     while (!Serial && millis() < 5000) { delay(10); }  // wait a bit for monitor
     Serial.println("CDC alive");
     
-//    node_config_t cfg;
     config_load(&cfg);
     
     Serial.printf("CFG node=%u count=%u\n", cfg.node_id, cfg.input_count);
     for (int i=0; i<cfg.input_count; i++) {
-    Serial.printf("CFG[%d] id=%u mode=%u\n", i, cfg.inputs[i].input_id, cfg.inputs[i].mode);
+        Serial.printf("CFG[%d] id=%u mode=%u\n", i, cfg.inputs[i].input_id, cfg.inputs[i].mode);
     }
 
+#if defined(NODE_ROLE_LCD)
     String LVGL_Arduino = "Hello LVGL! ";
     LVGL_Arduino += String('V') + lv_version_major() + "." + lv_version_minor() + "." + lv_version_patch();
 
@@ -324,9 +299,20 @@ void setup()
     Serial.println("LCD Setup done");
     //Enable CAN Transceiver path
     expander->digitalWrite(USB_SEL, HIGH);
+#else
+    /* Mechanical node: XIAO ESP32-S3 + XIAO CAN Bus Expansion Board (no I2C expander) */
+    Serial.println("Node (mechanical, XIAO + CAN expansion)");
+#endif
+
     delay(500); // Short delay to ensure the transceiver is ready
 
+#if defined(NODE_ROLE_LCD)
     CAN.begin(CAN_GPIO_RX, CAN_GPIO_TX, can::Baudrate::BAUD_500KBPS);
+#elif defined(NODE_ROLE_MIN)
+    if (CAN.begin(CAN_CS_GPIO) != ESP_OK) {
+        Serial.printf("MCP2515 CAN init failed (CS=%d)\n", CAN_CS_GPIO);
+    }
+#endif
 
     auto st = CAN.getStatus();
     if (st.state != 1) {
@@ -385,10 +371,12 @@ void handle_can_messages() {
                     if (idx < MAX_INPUTS_PER_NODE) {
                         cfg.inputs[idx].input_id = message.data[2];
                         cfg.inputs[idx].mode = (input_mode_t)(message.data[3] & 1);
+                        if (message.data_length_code >= 5)
+                            cfg.input_gpio[idx] = message.data[4];
                         config_save(&cfg);
                         config_get_timing(&s_timing);
                         input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
-                        Serial.printf("CONFIG: input[%u] -> id=%u mode=%u\n", (unsigned)idx, (unsigned)cfg.inputs[idx].input_id, (unsigned)cfg.inputs[idx].mode);
+                        Serial.printf("CONFIG: input[%u] -> id=%u mode=%u gpio=%u\n", (unsigned)idx, (unsigned)cfg.inputs[idx].input_id, (unsigned)cfg.inputs[idx].mode, (unsigned)cfg.input_gpio[idx]);
                     }
                 } else if (cmd == CMD_SET_INPUT_COUNT && message.data_length_code >= 2) {
                     uint8_t n = message.data[1];
@@ -399,11 +387,14 @@ void handle_can_messages() {
                         input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
                         Serial.printf("CONFIG: input_count set to %u\n", (unsigned)cfg.input_count);
                     }
-                } else if (cmd == CMD_SET_TIMING && message.data_length_code >= 9) {
+                } else if (cmd == CMD_SET_TIMING && message.data_length_code >= 8) {
+                    // CAN frame max 8 bytes: cmd + 7 data (click_max, gap, hold: 2B each; long_hold: 1B)
                     s_timing.click_max_ms       = (uint16_t)message.data[1] | ((uint16_t)message.data[2] << 8);
                     s_timing.double_click_gap_ms = (uint16_t)message.data[3] | ((uint16_t)message.data[4] << 8);
                     s_timing.hold_min_ms        = (uint16_t)message.data[5] | ((uint16_t)message.data[6] << 8);
-                    s_timing.long_hold_min_ms   = (uint16_t)message.data[7] | ((uint16_t)message.data[8] << 8);
+                    s_timing.long_hold_min_ms    = (message.data_length_code >= 9)
+                        ? ((uint16_t)message.data[7] | ((uint16_t)message.data[8] << 8))
+                        : (uint16_t)message.data[7];
                     config_set_timing(&s_timing);
                     input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
                     Serial.printf("CONFIG: timing updated\n");
@@ -426,6 +417,18 @@ void handle_can_messages() {
                     config_set_find_me_output(message.data[1]);
                     config_get_find_me_output(&find_me_output_index);
                     Serial.printf("CONFIG: find-me output index set to %u\n", (unsigned)find_me_output_index);
+                } else if (cmd == CMD_SET_DATETIME && message.data_length_code >= 5) {
+                    // Hub sends Unix timestamp every hour; set node RTC so status bar shows date/time
+                    uint32_t ts = (uint32_t)message.data[1] | ((uint32_t)message.data[2] << 8)
+                        | ((uint32_t)message.data[3] << 16) | ((uint32_t)message.data[4] << 24);
+                    if (ts > 0) {
+                        struct timeval tv = { .tv_sec = (time_t)ts, .tv_usec = 0 };
+                        if (settimeofday(&tv, NULL) == 0)
+                            Serial.printf("CONFIG: datetime set from hub (ts=%u)\n", (unsigned)ts);
+                    }
+                } else if (cmd == CMD_REBOOT) {
+                    Serial.println("CONFIG: reboot requested from hub");
+                    ESP.restart();
                 } else if (cmd == CMD_SET_INPUT_LABEL && message.data_length_code >= 3) {
                     uint8_t idx = message.data[1];
                     uint8_t seg = message.data[2];
@@ -472,25 +475,11 @@ void handle_can_messages() {
                 // Continue to update display with this message if desired, or return
             }
 
-            // Create a buffer for the display string
-            char buf[128];
-            
-            // Format the ID and the first 2 bytes of data as an example
-            // Adjust the %02X parts based on how much data you want to see
-            snprintf(buf, sizeof(buf), "ID: 0x%03X Data: %02X %02X %02X", 
-                     (unsigned int)message.identifier, 
-                     message.data[0], 
-                     message.data[1],
-                     message.data[2]);
-
-            
-            // Thread-safe UI update (timeout to avoid blocking forever and triggering watchdog)
-            if (lvgl_port_lock_with_timeout(50)) {
-                if (ui_CanStatusLabel != NULL) {
-                    lv_label_set_text(ui_CanStatusLabel, buf);
-                }
-                lvgl_port_unlock();
-            }
+            // Update CAN indicator: green dot when connected (poll task sets disconnected after idle)
+            s_last_can_rx_ms = millis();
+#if defined(NODE_ROLE_LCD)
+            ui_set_can_connected(true);
+#endif
         }
     }
 }
@@ -520,7 +509,18 @@ static void can_poll_task(void* arg) {
     for (;;) {
         handle_can_messages();
         input_engine_update();
-        
+
+#if defined(NODE_ROLE_MIN)
+        // Mechanical node: read GPIOs and feed levels into input engine (button-to-GND = active when LOW)
+        for (uint8_t i = 0; i < cfg.input_count && i < MAX_INPUTS_PER_NODE; i++) {
+            if (cfg.input_gpio[i] != 0xFF) {
+                pinMode(cfg.input_gpio[i], INPUT_PULLUP);
+                bool active = (digitalRead(cfg.input_gpio[i]) == LOW);
+                input_engine_process_level(cfg.inputs[i].input_id, active);
+            }
+        }
+#endif
+
         // Send periodic HEARTBEAT every 15 seconds
         unsigned long now_ms = millis();
         if (now_ms - last_heartbeat_ms >= 15000) {
@@ -541,6 +541,12 @@ static void can_poll_task(void* arg) {
                 find_me_last_toggle_ms = now_ms;
             }
         }
+
+#if defined(NODE_ROLE_LCD)
+        // CAN indicator dot: green when connected, red flashing when disconnected
+        bool connected = (now_ms - s_last_can_rx_ms <= CAN_STATUS_IDLE_MS);
+        ui_set_can_connected(connected);
+#endif
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }

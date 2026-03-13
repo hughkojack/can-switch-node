@@ -2,7 +2,9 @@
 #include "common/can.h"
 #include "common/config_store.h"
 #include <Arduino.h>
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 // ----- Fixed 4-card 2x2 main screen + status line at bottom -----
 
@@ -17,26 +19,40 @@ static lv_obj_t* s_power_icons[MAIN_SCREEN_BUTTONS_MAX] = { NULL };
 static lv_obj_t* s_pct_labels[MAIN_SCREEN_BUTTONS_MAX] = { NULL };
 static int s_selected_btn = 0;
 static bool s_slider_dragging[MAIN_SCREEN_BUTTONS_MAX] = { false };
+// After sending dim 0, ignore non-zero feedback briefly so node stays off until hub catches up
+static unsigned long s_sent_off_at_ms[MAIN_SCREEN_BUTTONS_MAX] = { 0 };
+static const unsigned long SENT_OFF_GRACE_MS = 500;
+// Last value we actually drew (0-100); -1 = not yet set (force first update)
+static int s_last_displayed_pct[MAIN_SCREEN_BUTTONS_MAX] = { -1, -1, -1, -1 };
+
+// Status bar time label (right-aligned); updated by LVGL timer to avoid cross-task flicker
+static lv_obj_t* s_time_label = NULL;
+static lv_timer_t* s_status_time_timer = NULL;
+// CAN indicator dot: green = connected, red = disconnected (flashing when disconnected)
+static lv_obj_t* s_can_indicator_dot = NULL;
+static lv_timer_t* s_can_flash_timer = NULL;
+static volatile bool s_can_connected = false;
+static bool s_can_flash_on = false;
+
+// No longer used (replaced by dot); kept for compatibility
+lv_obj_t* ui_CanStatusLabel = NULL;
 
 static void update_selection_highlight(void) {
-    int N = (int)s_ui_cfg.input_count;
-    if (N < 1) N = 1;
-    if (s_selected_btn >= N) s_selected_btn = 0;
+    (void)s_selected_btn;  // selection no longer changes border; all cards have same white matte border
     for (int i = 0; i < MAIN_SCREEN_BUTTONS_MAX; i++) {
         if (s_cards[i]) {
-            lv_obj_set_style_border_width(s_cards[i], 0, 0);
-            lv_obj_set_style_border_color(s_cards[i], lv_color_hex(0x000000), 0);
+            lv_obj_set_style_border_width(s_cards[i], 2, 0);
+            lv_obj_set_style_border_color(s_cards[i], lv_color_hex(0xEEEEEE), 0);
         }
-    }
-    if (s_selected_btn < N && s_cards[s_selected_btn]) {
-        lv_obj_set_style_border_width(s_cards[s_selected_btn], 3, 0);
-        lv_obj_set_style_border_color(s_cards[s_selected_btn], lv_color_hex(0x00A0FF), 0);
     }
 }
 
-// Update power icon opacity and brightness % digit for one card
+// Update power icon opacity and brightness % digit for one card (only when value changed to avoid flicker)
 static void update_card_brightness_ui(int btn_index, int value) {
     if (btn_index < 0 || btn_index >= MAIN_SCREEN_BUTTONS_MAX) return;
+    if (s_last_displayed_pct[btn_index] == value) return;
+    s_last_displayed_pct[btn_index] = value;
+
     if (s_pct_labels[btn_index]) {
         lv_label_set_text_fmt(s_pct_labels[btn_index], "%d%%", value);
     }
@@ -65,6 +81,24 @@ static void button_click_cb(lv_event_t* e) {
     update_selection_highlight();
 }
 
+// Power icon click: toggle between off (0) and on at 50%
+static void power_icon_click_cb(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    lv_event_stop_bubbling(e);
+    uint8_t btn_index = (uint8_t)(intptr_t)lv_event_get_user_data(e);
+    if (btn_index >= s_ui_cfg.input_count) return;
+    uint8_t input_id = (uint8_t)(btn_index + 1);
+    int cur = (s_feedback_brightness[btn_index] <= 100) ? (int)s_feedback_brightness[btn_index] : 0;
+    int next = (cur > 0) ? 0 : 50;
+    s_feedback_brightness[btn_index] = (uint8_t)next;
+    if (next == 0)
+        s_sent_off_at_ms[btn_index] = millis();
+    can_send_dim(s_ui_cfg.node_id, input_id, (uint8_t)next);
+    if (s_card_sliders[btn_index])
+        lv_slider_set_value(s_card_sliders[btn_index], next, LV_ANIM_ON);
+    update_card_brightness_ui((int)btn_index, next);
+}
+
 // Per-card horizontal slider: change brightness for this card only
 static void card_slider_cb(lv_event_t* e) {
     lv_event_code_t code = lv_event_get_code(e);
@@ -87,6 +121,8 @@ static void card_slider_cb(lv_event_t* e) {
     if (v < 0) v = 0;
     if (v > 100) v = 100;
     s_feedback_brightness[btn_index] = (uint8_t)v;
+    if (v == 0)
+        s_sent_off_at_ms[btn_index] = millis();
     can_send_dim(s_ui_cfg.node_id, (uint8_t)(btn_index + 1), (uint8_t)v);
     update_card_brightness_ui((int)btn_index, (int)v);
 }
@@ -111,7 +147,8 @@ static void create_card(lv_obj_t* parent, int i, lv_coord_t card_w, lv_coord_t c
     lv_obj_set_size(card, card_w, card_h);
     lv_obj_set_style_radius(card, 16, 0);
     lv_obj_set_style_bg_color(card, lv_color_hex(0x383838), 0);
-    lv_obj_set_style_border_width(card, 0, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0xEEEEEE), 0);  // white matte border for all cards
     lv_obj_set_style_pad_all(card, 8, 0);
     lv_obj_set_style_pad_top(card, 2, 0);       // minimum above power icon to leave room for slider
     lv_obj_set_style_pad_bottom(card, 44, 0);  // room for slider track (36) + knob overflow (48/2 - 36/2) so knob isn't clipped
@@ -135,6 +172,7 @@ static void create_card(lv_obj_t* parent, int i, lv_coord_t card_w, lv_coord_t c
     lv_obj_t* lbl = lv_label_create(top_row);
     lv_label_set_text(lbl, "");
     lv_obj_set_style_text_font(lbl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0xEEEEEE), 0);  // white matte
     update_button_label(lbl, i);
     s_btn_labels[i] = lbl;
 
@@ -150,12 +188,15 @@ static void create_card(lv_obj_t* parent, int i, lv_coord_t card_w, lv_coord_t c
     lv_obj_set_style_text_font(power_lbl, &lv_font_montserrat_48, 0);
     lv_obj_set_style_pad_all(power_lbl, 2, 0);
     lv_obj_set_style_radius(power_lbl, 4, 0);
+    lv_obj_add_flag(power_lbl, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(power_lbl, power_icon_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
     s_power_icons[i] = power_lbl;
 
     lv_obj_t* pct_lbl = lv_label_create(right_block);
     int v = (s_feedback_brightness[i] <= 100) ? (int)s_feedback_brightness[i] : 0;
     lv_label_set_text_fmt(pct_lbl, "%d%%", v);
     lv_obj_set_style_text_font(pct_lbl, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(pct_lbl, lv_color_hex(0xEEEEEE), 0);  // white matte
     s_pct_labels[i] = pct_lbl;
 
     update_card_brightness_ui(i, v);
@@ -175,7 +216,7 @@ static void create_card(lv_obj_t* parent, int i, lv_coord_t card_w, lv_coord_t c
     lv_slider_set_range(slider, 0, 100);
     lv_slider_set_value(slider, v, LV_ANIM_OFF);
     lv_obj_set_style_radius(slider, 6, 0);
-    lv_obj_set_style_bg_color(slider, lv_color_hex(0x404040), 0);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(0x7e7e7e), 0);  // fixed color right of knob
     lv_obj_set_style_bg_color(slider, lv_color_hex(0x4ade80), LV_PART_INDICATOR);  // light green fill left of knob
     lv_obj_set_style_radius(slider, 6, LV_PART_INDICATOR);
     lv_obj_set_style_width(slider, 48, LV_PART_KNOB);
@@ -192,6 +233,54 @@ static void create_card(lv_obj_t* parent, int i, lv_coord_t card_w, lv_coord_t c
     lv_obj_add_event_cb(card, button_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
 
     // Cards with index >= input_count are guarded in callbacks (no CAN send)
+}
+
+// Called every 1s from LVGL task; only updates label when string changes (stable, no flicker)
+// Shows date/time from hub when set (CMD_SET_DATETIME), otherwise uptime.
+static void on_status_time_update(lv_timer_t* timer) {
+    (void)timer;
+    if (s_time_label == NULL) return;
+    char buf[24];
+    time_t now = time(nullptr);
+    // Use wall clock if hub has set it (reasonable Unix time, e.g. after 2020)
+    if (now > 1600000000) {
+        struct tm* t = localtime(&now);
+        if (t)
+            strftime(buf, sizeof(buf), "%a %H:%M", t);
+        else
+            snprintf(buf, sizeof(buf), "--:--");
+    } else {
+        unsigned long sec = millis() / 1000;
+        unsigned long h = sec / 3600;
+        unsigned long m = (sec % 3600) / 60;
+        unsigned long s = sec % 60;
+        snprintf(buf, sizeof(buf), "%lu:%02lu:%02lu", h, m, s);
+    }
+    static char last[24] = { '\0' };
+    if (strcmp(buf, last) != 0) {
+        lv_label_set_text(s_time_label, buf);
+        strncpy(last, buf, sizeof(last) - 1);
+        last[sizeof(last) - 1] = '\0';
+    }
+}
+
+// Called every 500ms from LVGL task; flashes red dot when CAN disconnected
+static void on_can_flash_timer(lv_timer_t* timer) {
+    (void)timer;
+    if (s_can_indicator_dot == NULL) return;
+    if (s_can_connected) {
+        lv_obj_set_style_bg_color(s_can_indicator_dot, lv_color_hex(0x00C000), 0);
+        lv_obj_set_style_bg_opa(s_can_indicator_dot, LV_OPA_COVER, 0);
+        return;
+    }
+    s_can_flash_on = !s_can_flash_on;
+    lv_obj_set_style_bg_color(s_can_indicator_dot, lv_color_hex(0xC00000), 0);
+    lv_obj_set_style_bg_opa(s_can_indicator_dot, s_can_flash_on ? LV_OPA_COVER : LV_OPA_30, 0);
+}
+
+void ui_set_can_connected(bool connected) {
+    s_can_connected = connected;
+    // Dot is updated by on_can_flash_timer (LVGL task) so we don't touch LVGL from CAN task
 }
 
 void setup_wall_switch_ui(void) {
@@ -262,14 +351,25 @@ void setup_wall_switch_ui(void) {
     create_card(row2, 2, card_w, card_h);
     create_card(row2, 3, card_w, card_h);
 
-    // Status line at bottom
-    ui_CanStatusLabel = lv_label_create(scr);
-    lv_obj_set_width(ui_CanStatusLabel, lcd_w - 100);
-    lv_obj_align(ui_CanStatusLabel, LV_ALIGN_BOTTOM_LEFT, 10, -8);
-    lv_obj_set_style_text_align(ui_CanStatusLabel, LV_TEXT_ALIGN_LEFT, 0);
-    lv_obj_set_style_text_color(ui_CanStatusLabel, lv_palette_main(LV_PALETTE_AMBER), 0);
-    lv_obj_set_style_text_font(ui_CanStatusLabel, &lv_font_montserrat_28, 0);
-    lv_label_set_text(ui_CanStatusLabel, "CAN Bus: Waiting...");
+    // Status line at bottom: CAN indicator dot (green = connected, red flashing = disconnected) + time on right
+    s_can_indicator_dot = lv_obj_create(scr);
+    lv_obj_set_size(s_can_indicator_dot, 14, 14);
+    lv_obj_align(s_can_indicator_dot, LV_ALIGN_BOTTOM_LEFT, 10, -9);
+    lv_obj_set_style_radius(s_can_indicator_dot, 7, 0);
+    lv_obj_set_style_border_width(s_can_indicator_dot, 0, 0);
+    lv_obj_set_style_bg_color(s_can_indicator_dot, lv_color_hex(0xC00000), 0);
+    lv_obj_set_style_bg_opa(s_can_indicator_dot, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(s_can_indicator_dot, LV_OBJ_FLAG_CLICKABLE);
+    s_can_flash_timer = lv_timer_create(on_can_flash_timer, 500, NULL);
+
+    // Time label (right-aligned); updated by LVGL timer at 1s so no cross-task flicker
+    s_time_label = lv_label_create(scr);
+    lv_obj_align(s_time_label, LV_ALIGN_BOTTOM_RIGHT, -10, -8);
+    lv_obj_set_style_text_align(s_time_label, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_color(s_time_label, lv_palette_main(LV_PALETTE_AMBER), 0);
+    lv_obj_set_style_text_font(s_time_label, &lv_font_montserrat_28, 0);
+    lv_label_set_text(s_time_label, "0:00:00");
+    s_status_time_timer = lv_timer_create(on_status_time_update, 1000, NULL);
 
     s_selected_btn = 0;
     update_selection_highlight();
@@ -285,8 +385,12 @@ void ui_set_feedback_brightness(uint8_t btn_index, uint8_t brightness_0_100_or_2
     if (btn_index >= MAIN_SCREEN_BUTTONS_MAX) return;
     // Don't overwrite slider while user is dragging it (stops feedback from snapping 1 and 4 back to zero)
     if (s_slider_dragging[btn_index]) return;
+    // After we sent off (dim 0), ignore non-zero feedback for a short time so node stays off until hub catches up
+    if (brightness_0_100_or_255 > 0 && (unsigned long)(millis() - s_sent_off_at_ms[btn_index]) < SENT_OFF_GRACE_MS)
+        return;
     s_feedback_brightness[btn_index] = brightness_0_100_or_255;
     int v = (brightness_0_100_or_255 <= 100) ? (int)brightness_0_100_or_255 : 0;
+    if (s_last_displayed_pct[btn_index] == v) return;  // no change, skip LVGL updates to avoid flicker
     if (s_card_sliders[btn_index]) {
         lv_slider_set_value(s_card_sliders[btn_index], v, LV_ANIM_ON);
     }

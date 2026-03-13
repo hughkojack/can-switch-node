@@ -23,6 +23,8 @@ extern "C" {
 #define CMD_FIND_ME            0x05  // payload: [duration_min]; drive find-me output for N minutes (1-30)
 #define CMD_SET_FIND_ME_OUTPUT  0x06  // payload: [output_index]; store in NVS for find-me blink
 #define CMD_SET_INPUT_LABEL     0x07  // payload: [input_index, total_len|0xFF, c0..c5]; multi-frame for len>6
+#define CMD_SET_DATETIME       0x08  // payload: Unix timestamp (uint32_t LE, bytes 1-4); hub sends every hour
+#define CMD_REBOOT             0x09  // no payload; node restarts
 
 // Node types for announce (payload byte 0)
 #define NODE_TYPE_LCD        1

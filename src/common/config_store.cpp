@@ -16,6 +16,7 @@ static const uint16_t DEFAULT_LONG_HOLD_MIN_MS = 2000;
 static void apply_defaults(node_config_t* out_cfg) {
   out_cfg->node_id = NODE_ID_UNCONFIGURED;
   memset(out_cfg->input_labels, 0, sizeof(out_cfg->input_labels));
+  memset(out_cfg->input_gpio, 0xFF, sizeof(out_cfg->input_gpio));
 #if defined(NODE_ROLE_MIN)
   out_cfg->input_count = 1;
   out_cfg->inputs[0] = { 1, INPUT_MODE_TOGGLE };
@@ -31,6 +32,8 @@ static void apply_defaults(node_config_t* out_cfg) {
 
 // Size of node_config_t before input_labels was added (for NVS backward compatibility)
 #define OLD_NODE_CONFIG_SIZE  (sizeof(uint8_t) * 2 + sizeof(input_cfg_t) * MAX_INPUTS_PER_NODE)
+// Size before input_gpio was added (labels present, no GPIO array)
+#define NODE_CONFIG_SIZE_WITH_LABELS  (sizeof(uint8_t) * 2 + sizeof(input_cfg_t) * MAX_INPUTS_PER_NODE + MAX_INPUTS_PER_NODE * (MAX_INPUT_LABEL_LEN + 1))
 
 bool config_load(node_config_t* out_cfg) {
   if (!out_cfg) return false;
@@ -47,6 +50,14 @@ bool config_load(node_config_t* out_cfg) {
   if (len == OLD_NODE_CONFIG_SIZE) {
     // Old NVS layout: zero labels and use the rest
     memset(out_cfg->input_labels, 0, sizeof(out_cfg->input_labels));
+    memset(out_cfg->input_gpio, 0xFF, sizeof(out_cfg->input_gpio));
+    if (out_cfg->input_count > MAX_INPUTS_PER_NODE) out_cfg->input_count = MAX_INPUTS_PER_NODE;
+    if (out_cfg->input_count < 1) out_cfg->input_count = 1;
+    return true;
+  }
+  if (len == NODE_CONFIG_SIZE_WITH_LABELS) {
+    // Layout with labels but no input_gpio: set GPIOs to unassigned
+    memset(out_cfg->input_gpio, 0xFF, sizeof(out_cfg->input_gpio));
     if (out_cfg->input_count > MAX_INPUTS_PER_NODE) out_cfg->input_count = MAX_INPUTS_PER_NODE;
     if (out_cfg->input_count < 1) out_cfg->input_count = 1;
     return true;
@@ -99,6 +110,14 @@ bool config_get_timing(input_timing_t* out_timing) {
   if (!out_timing) return false;
   Preferences prefs;
   if (!prefs.begin(NVS_NAMESPACE, true)) {
+    out_timing->click_max_ms = DEFAULT_CLICK_MAX_MS;
+    out_timing->double_click_gap_ms = DEFAULT_DOUBLE_CLICK_GAP_MS;
+    out_timing->hold_min_ms = DEFAULT_HOLD_MIN_MS;
+    out_timing->long_hold_min_ms = DEFAULT_LONG_HOLD_MIN_MS;
+    return true;
+  }
+  if (!prefs.isKey(NVS_KEY_TIMING)) {
+    prefs.end();
     out_timing->click_max_ms = DEFAULT_CLICK_MAX_MS;
     out_timing->double_click_gap_ms = DEFAULT_DOUBLE_CLICK_GAP_MS;
     out_timing->hold_min_ms = DEFAULT_HOLD_MIN_MS;

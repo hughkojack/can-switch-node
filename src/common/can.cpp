@@ -1,5 +1,5 @@
 #include "can.h"
-#include "ESP32TWAISingleton.hpp"
+#include "can_driver.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"

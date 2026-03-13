@@ -17,6 +17,7 @@ typedef struct {
   uint8_t input_count;   // 1..MAX_INPUTS_PER_NODE
   input_cfg_t inputs[MAX_INPUTS_PER_NODE];
   char input_labels[MAX_INPUTS_PER_NODE][MAX_INPUT_LABEL_LEN + 1];
+  uint8_t input_gpio[MAX_INPUTS_PER_NODE];  // GPIO pin per input (mechanical node); 0xFF = not assigned
 } node_config_t;
 
 // Load config from NVS; if not found, provide defaults (node_id = NODE_ID_UNCONFIGURED, etc.)
