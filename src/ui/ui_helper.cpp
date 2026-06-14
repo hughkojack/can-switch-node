@@ -240,13 +240,13 @@ static void create_card(lv_obj_t* parent, int i, lv_coord_t card_w, lv_coord_t c
 static void on_status_time_update(lv_timer_t* timer) {
     (void)timer;
     if (s_time_label == NULL) return;
-    char buf[24];
+    char buf[32];
     time_t now = time(nullptr);
     // Use wall clock if hub has set it (reasonable Unix time, e.g. after 2020)
     if (now > 1600000000) {
         struct tm* t = localtime(&now);
         if (t)
-            strftime(buf, sizeof(buf), "%a %H:%M", t);
+            strftime(buf, sizeof(buf), "%a %d %b %H:%M", t);
         else
             snprintf(buf, sizeof(buf), "--:--");
     } else {
@@ -256,7 +256,7 @@ static void on_status_time_update(lv_timer_t* timer) {
         unsigned long s = sec % 60;
         snprintf(buf, sizeof(buf), "%lu:%02lu:%02lu", h, m, s);
     }
-    static char last[24] = { '\0' };
+    static char last[32] = { '\0' };
     if (strcmp(buf, last) != 0) {
         lv_label_set_text(s_time_label, buf);
         strncpy(last, buf, sizeof(last) - 1);

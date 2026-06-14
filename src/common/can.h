@@ -8,16 +8,19 @@ extern "C" {
 
 // ---- CAN Protocol ----
 #define CAN_MSG_INPUT_EVENT   0x1
+#define CAN_MSG_SENSOR_DATA   0x2   // Hub -> node: link keepalive (mechanical nodes; used for CAN link LED)
 #define CAN_MSG_NODE_CONFIG   0x3   // Hub -> node: configuration
 #define CAN_MSG_STATE_FEEDBACK 0x4  // Hub -> node: per-button brightness [b1,b2,b3,b4] 0-100 or 0xFF
+#define CAN_MSG_FIRMWARE       0x5  // Hub -> node: OTA firmware transfer
 #define CAN_MSG_NODE_ANNOUNCE 0x8   // Node -> hub: heartbeat/announce (reuse HEARTBEAT type)
+#define CAN_MSG_FIRMWARE_STATUS 0x9 // Node -> hub: OTA ACK/NACK/progress
 
 // Unconfigured node ID (127): hub detects new nodes; valid configured IDs 1..126
 #define NODE_ID_UNCONFIGURED  127
 
 // Config sub-commands (payload byte 0 when CAN_MSG_NODE_CONFIG)
 #define CMD_SET_NODE_ID        0x01
-#define CMD_SET_INPUT_CFG      0x02  // payload: [input_index 0..5, input_id, mode]; mode 0=momentary 1=toggle
+#define CMD_SET_INPUT_CFG      0x02  // after cmd byte: [idx][input_id][mode][gpio?][active_high?]; DLC 4 legacy; 5 +gpio; 6 +active_high (0=low 1=high)
 #define CMD_SET_INPUT_COUNT    0x03  // payload: [count]; count 1..6 (hub and node aligned)
 #define CMD_SET_TIMING         0x04  // optional: click_max, dbl_gap, hold_min, long_hold (e.g. 4x uint16_t)
 #define CMD_FIND_ME            0x05  // payload: [duration_min]; drive find-me output for N minutes (1-30)
@@ -25,6 +28,11 @@ extern "C" {
 #define CMD_SET_INPUT_LABEL     0x07  // payload: [input_index, total_len|0xFF, c0..c5]; multi-frame for len>6
 #define CMD_SET_DATETIME       0x08  // payload: Unix timestamp (uint32_t LE, bytes 1-4); hub sends every hour
 #define CMD_REBOOT             0x09  // no payload; node restarts
+#define CMD_SET_CAN_LINK_INDICATOR 0x0A  // payload: [gpio]; GPIO 0-48 for CAN link LED (solid=good link, flash=bad/no link), 0xFF=disable
+#define CMD_SET_TIMEZONE          0x0B  // payload: multi-frame [total_len|0xFF, c0..c5]; hub sends before CMD_SET_DATETIME so LCD uses setenv("TZ",...) and localtime()
+#define CMD_SET_NIGHT_LIGHT       0x0C  // payload: [enabled 0/1, brightness 0-100]; mechanical WS2812 night light (stored in NVS)
+#define CMD_SET_WS2812_CLICK_EFFECT 0x0D  // payload: [effect 0=strobe, 1=chase]; press feedback for click/double-click (NVS)
+#define CMD_SET_WS2812_EFFECT_PARAMS 0x0E // payload: [effect_id, r, g, b, timing_ms u16 LE]; store only (NVS)
 
 // Node types for announce (payload byte 0)
 #define NODE_TYPE_LCD        1
@@ -58,6 +66,9 @@ bool can_send_dim(uint8_t node_id, uint8_t input_id, uint8_t brightness_0_100);
 
 // Node -> hub: announce/heartbeat (node_id, type, input_count) so hub can detect new nodes
 bool can_send_node_announce(uint8_t node_id, uint8_t node_type, uint8_t input_count);
+bool can_send_node_announce_ex(uint8_t node_id, uint8_t node_type, uint8_t input_count,
+                               uint16_t fw_version, uint8_t ota_capable);
+bool can_send_firmware_status(uint8_t node_id, uint8_t status, uint16_t seq, uint32_t extra);
 
 #ifdef __cplusplus
 }

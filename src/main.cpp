@@ -5,6 +5,11 @@
 #include "common/can.h"
 #include "common/input_engine.h"
 #include "common/config_store.h"
+#include "common/boot_ota_guard.h"
+#if defined(NODE_ROLE_MIN)
+#include "common/ws2812_strip.h"
+#include "common/node_ota.h"
+#endif
 
 // Node ID comes from config (default NODE_ID_UNCONFIGURED = 127 until hub assigns one)
 
@@ -51,8 +56,8 @@ void start_ui()
 #if defined(NODE_ROLE_LCD)
 #include <lvgl.h>
 #include <ESP_Panel_Library.h>
-#endif
 #include <ESP_IOExpander_Library.h>
+#endif
 
 
 // Extend IO Pin define
@@ -72,8 +77,9 @@ void start_ui()
 #define CAN_GPIO_TX GPIO_NUM_20
 
 #if defined(NODE_ROLE_MIN)
-// Mechanical node: Seeed XIAO ESP32-S3 + XIAO CAN Bus Expansion Board (MCP2515).
-// Expansion board CS is connected to D7 pad; on XIAO_ESP32S3 variant D7 = GPIO 44 (see pins_arduino.h).
+// Mechanical node: MCP2515 (e.g. Seeed XIAO CAN Bus Expansion). CS = D7 on XIAO:
+//   ESP32-S3 XIAO: D7 -> GPIO 44  |  ESP32-C3 XIAO: D7 -> GPIO 20 (see pins_arduino.h / Seeed wiki).
+// Set CAN_CS_GPIO in platformio.ini per board (node_min vs node_min_c3).
 #ifndef CAN_CS_GPIO
 #define CAN_CS_GPIO 44
 #endif
@@ -96,18 +102,46 @@ SemaphoreHandle_t lvgl_mux = NULL;                  // LVGL mutex
 
 static node_config_t cfg;
 
-// For find-me: I/O index = ESP32-S3 chip I/O (GPIO number), independent of input count (1-6).
+// For find-me: chip GPIO (hub may allow 0–48 in UI; valid range is board-specific — see FIND_ME_GPIO_MAX).
+#if defined(NODE_ROLE_LCD)
 static ESP_IOExpander* g_expander = nullptr;
+#endif
 static unsigned long find_me_until = 0;   // millis() when to turn find-me output off
-static uint8_t find_me_output_index = 0;  // cached from NVS: GPIO number (0-48)
+static uint8_t find_me_output_index = 0;  // cached from NVS: GPIO number
+static uint8_t can_link_indicator_gpio = 0xFF;  // CAN link LED GPIO; 0xFF=disabled
 static input_timing_t s_timing;            // timing from NVS, passed to input_engine
 
-// CAN status: dot indicator (green / red flashing) driven by s_last_can_rx_ms
+// CAN status: dot indicator (green / red flashing) driven by hub-to-node traffic
 static unsigned long s_last_can_rx_ms = 0;
+static unsigned long s_last_hub_to_node_rx_ms = 0;
 #define CAN_STATUS_IDLE_MS 2500
+#define HUB_LINK_THRESHOLD_MS 30000  // match hub online threshold so indicator aligns with hub "online/offline"
 
-// Find Me I/O index = ESP32-S3 GPIO number (0-48). Use a GPIO that is free on your board (not used by CAN, I2C, etc.).
+// Max GPIO index for find-me / CAN link checks (S3 XIAO: 48; C3: 21). Override via platformio build_flags.
+#ifndef FIND_ME_GPIO_MAX
 #define FIND_ME_GPIO_MAX 48
+#endif
+
+#if defined(NODE_ROLE_MIN)
+static void on_input_click_flash(uint8_t input_id, uint8_t event_code) {
+  (void)input_id;
+  if (event_code == EVT_CLICK || event_code == EVT_DOUBLE_CLICK) {
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+    ws2812_request_trigger_input_effect();
+#else
+    ws2812_trigger_input_effect();
+#endif
+  }
+}
+
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+static void input_engine_reinit(void) {
+  config_get_timing(&s_timing);
+  input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
+  input_engine_set_event_callback(on_input_click_flash);
+}
+#endif
+#endif
 
 static inline uint16_t createCanId(CanMessageType msgType, uint8_t nodeId) {
   return ((uint16_t)msgType << 7) | (nodeId & 0x7F);
@@ -197,15 +231,25 @@ void lvgl_port_task(void *arg)
 
 void setup()
 {
-    Serial.begin(115200); /* prepare for possible serial debug */
-    while (!Serial && millis() < 5000) { delay(10); }  // wait a bit for monitor
+    Serial.begin(115200);
+    delay(50);
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+    // Do not block boot waiting for USB host — CAN must start even with no serial monitor.
+#else
+    while (!Serial && millis() < 5000) { delay(10); }
+#endif
+    Serial.println("BOOT: setup enter");
+    Serial.flush();
+    boot_ota_guard();
     Serial.println("CDC alive");
     
     config_load(&cfg);
     
     Serial.printf("CFG node=%u count=%u\n", cfg.node_id, cfg.input_count);
     for (int i=0; i<cfg.input_count; i++) {
-        Serial.printf("CFG[%d] id=%u mode=%u\n", i, cfg.inputs[i].input_id, cfg.inputs[i].mode);
+        uint8_t ig = cfg.input_gpio[i];
+        if (ig == 0xFF) ig = (uint8_t)(i + 1);
+        Serial.printf("CFG[%d] id=%u mode=%u gpio=%u\n", i, cfg.inputs[i].input_id, cfg.inputs[i].mode, (unsigned)ig);
     }
 
 #if defined(NODE_ROLE_LCD)
@@ -300,7 +344,7 @@ void setup()
     //Enable CAN Transceiver path
     expander->digitalWrite(USB_SEL, HIGH);
 #else
-    /* Mechanical node: XIAO ESP32-S3 + XIAO CAN Bus Expansion Board (no I2C expander) */
+    /* Mechanical: XIAO ESP32-S3 or XIAO ESP32C3 + CAN expansion (MCP2515); CS from CAN_CS_GPIO in platformio */
     Serial.println("Node (mechanical, XIAO + CAN expansion)");
 #endif
 
@@ -324,7 +368,17 @@ void setup()
         
     // init input engine with loaded config
     config_get_timing(&s_timing);
+    config_get_can_link_indicator_gpio(&can_link_indicator_gpio);
+    Serial.printf("CAN link indicator GPIO=%u (0xFF=disabled)\n", (unsigned)can_link_indicator_gpio);
     input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
+
+#if defined(NODE_ROLE_MIN)
+    node_ota_set_node_id(cfg.node_id);
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+    ws2812_start_task();
+#endif
+    input_engine_set_event_callback(on_input_click_flash);
+#endif
 
     // Announce to hub (node_id, type, input_count) so hub can detect new/unconfigured nodes
 #if defined(NODE_ROLE_LCD)
@@ -340,14 +394,27 @@ void setup()
 
 void handle_can_messages() {
     twai_message_t message;
-    twai_status_info_t status = CAN.getStatus();
 
-    if (status.msgs_to_rx > 0) {
-        if (CAN.read(&message) == ESP_OK) {
+    for (;;) {
+        twai_status_info_t status = CAN.getStatus();
+        if (status.msgs_to_rx == 0)
+            break;
+        if (CAN.read(&message) != ESP_OK)
+            break;
             // Handle hub -> node config (addressed to this node or unconfigured)
             uint8_t msg_type = (uint8_t)((message.identifier >> 7) & 0x0F);
             uint8_t target_id = (uint8_t)(message.identifier & 0x7F);
-            if (msg_type == CAN_MSG_STATE_FEEDBACK && target_id == cfg.node_id && message.data_length_code >= 4) {
+            // Hub-link: hub -> node traffic addressed to this node (incl. OTA firmware stream)
+            if (target_id == cfg.node_id) {
+                if (msg_type == CAN_MSG_SENSOR_DATA || msg_type == CAN_MSG_NODE_CONFIG
+                    || msg_type == CAN_MSG_STATE_FEEDBACK || msg_type == CAN_MSG_FIRMWARE)
+                    s_last_hub_to_node_rx_ms = millis();
+            }
+            if (msg_type == CAN_MSG_FIRMWARE && target_id == cfg.node_id && message.data_length_code >= 1) {
+#if defined(NODE_ROLE_MIN)
+                node_ota_on_can_frame(message.data, message.data_length_code);
+#endif
+            } else if (msg_type == CAN_MSG_STATE_FEEDBACK && target_id == cfg.node_id && message.data_length_code >= 4) {
 #if defined(NODE_ROLE_LCD)
                 if (lvgl_port_lock_with_timeout(50)) {
                     for (int i = 0; i < 4; i++)
@@ -356,14 +423,27 @@ void handle_can_messages() {
                 }
 #endif
             } else if (msg_type == CAN_MSG_NODE_CONFIG && target_id == cfg.node_id && message.data_length_code >= 1) {
+#if defined(NODE_ROLE_MIN)
+                if (node_ota_is_active()) {
+                    if (message.data[0] != CMD_REBOOT)
+                        continue;
+                }
+#endif
                 uint8_t cmd = message.data[0];
                 if (cmd == CMD_SET_NODE_ID && message.data_length_code >= 2) {
                     uint8_t new_id = message.data[1];
                     if (new_id != 0 && new_id <= 126) {
                         cfg.node_id = new_id;
                         config_save(&cfg);
+#if defined(NODE_ROLE_MIN)
+                        node_ota_set_node_id(cfg.node_id);
+#endif
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+                        input_engine_reinit();
+#else
                         config_get_timing(&s_timing);
                         input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
+#endif
                         Serial.printf("CONFIG: node_id set to %u\n", (unsigned)cfg.node_id);
                     }
                 } else if (cmd == CMD_SET_INPUT_CFG && message.data_length_code >= 4) {
@@ -371,36 +451,63 @@ void handle_can_messages() {
                     if (idx < MAX_INPUTS_PER_NODE) {
                         cfg.inputs[idx].input_id = message.data[2];
                         cfg.inputs[idx].mode = (input_mode_t)(message.data[3] & 1);
-                        if (message.data_length_code >= 5)
+                        if (message.data_length_code >= 5) {
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+                            if (message.data[4] == WS2812_GPIO) {
+                                Serial.printf("CONFIG: reject input GPIO %u (WS2812 data pin)\n", (unsigned)WS2812_GPIO);
+                            } else
+#endif
                             cfg.input_gpio[idx] = message.data[4];
+                        }
+                        if (message.data_length_code >= 6)
+                            cfg.input_active_high[idx] = message.data[5] & 1;
                         config_save(&cfg);
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+                        input_engine_reinit();
+#else
                         config_get_timing(&s_timing);
                         input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
-                        Serial.printf("CONFIG: input[%u] -> id=%u mode=%u gpio=%u\n", (unsigned)idx, (unsigned)cfg.inputs[idx].input_id, (unsigned)cfg.inputs[idx].mode, (unsigned)cfg.input_gpio[idx]);
+#endif
+                        Serial.printf("CONFIG: input[%u] -> id=%u mode=%u gpio=%u active_high=%u\n", (unsigned)idx, (unsigned)cfg.inputs[idx].input_id, (unsigned)cfg.inputs[idx].mode, (unsigned)cfg.input_gpio[idx], (unsigned)cfg.input_active_high[idx]);
                     }
                 } else if (cmd == CMD_SET_INPUT_COUNT && message.data_length_code >= 2) {
                     uint8_t n = message.data[1];
                     if (n >= 1 && n <= 6) {
                         cfg.input_count = n;
                         config_save(&cfg);
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+                        input_engine_reinit();
+#else
                         config_get_timing(&s_timing);
                         input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
+#endif
                         Serial.printf("CONFIG: input_count set to %u\n", (unsigned)cfg.input_count);
                     }
-                } else if (cmd == CMD_SET_TIMING && message.data_length_code >= 8) {
-                    // CAN frame max 8 bytes: cmd + 7 data (click_max, gap, hold: 2B each; long_hold: 1B)
-                    s_timing.click_max_ms       = (uint16_t)message.data[1] | ((uint16_t)message.data[2] << 8);
-                    s_timing.double_click_gap_ms = (uint16_t)message.data[3] | ((uint16_t)message.data[4] << 8);
-                    s_timing.hold_min_ms        = (uint16_t)message.data[5] | ((uint16_t)message.data[6] << 8);
-                    s_timing.long_hold_min_ms    = (message.data_length_code >= 9)
-                        ? ((uint16_t)message.data[7] | ((uint16_t)message.data[8] << 8))
-                        : (uint16_t)message.data[7];
+                } else if (cmd == CMD_SET_TIMING && message.data_length_code >= 6) {
+                    // Two-frame format: data[1]=part (0 or 1), data[2..5]=two uint16 LE
+                    uint8_t part = message.data[1];
+                    config_get_timing(&s_timing);
+                    if (part == 0) {
+                        s_timing.click_max_ms        = (uint16_t)message.data[2] | ((uint16_t)message.data[3] << 8);
+                        s_timing.double_click_gap_ms = (uint16_t)message.data[4] | ((uint16_t)message.data[5] << 8);
+                    } else if (part == 1) {
+                        s_timing.hold_min_ms     = (uint16_t)message.data[2] | ((uint16_t)message.data[3] << 8);
+                        s_timing.long_hold_min_ms = (uint16_t)message.data[4] | ((uint16_t)message.data[5] << 8);
+                    }
                     config_set_timing(&s_timing);
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+                    input_engine_reinit();
+#else
                     input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
-                    Serial.printf("CONFIG: timing updated\n");
+#endif
+                    Serial.printf("CONFIG: timing updated (part %u)\n", (unsigned)part);
                 } else if (cmd == CMD_FIND_ME) {
                     uint8_t duration_min = (message.data_length_code >= 2) ? message.data[1] : 5;
                     if (duration_min == 0) duration_min = 5;
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+                    ws2812_request_find_me(duration_min);
+                    Serial.printf("CONFIG: find-me on for %u min (WS2812 strip)\n", (unsigned)duration_min);
+#else
                     config_get_find_me_output(&find_me_output_index);
                     if (find_me_output_index <= FIND_ME_GPIO_MAX) {
                         uint8_t gpio = find_me_output_index;
@@ -413,12 +520,91 @@ void handle_can_messages() {
                     }
                     find_me_until = millis() + (unsigned long)duration_min * 60 * 1000;
                     Serial.printf("CONFIG: find-me on for %u min (GPIO=%u)\n", (unsigned)duration_min, (unsigned)find_me_output_index);
+#endif
                 } else if (cmd == CMD_SET_FIND_ME_OUTPUT && message.data_length_code >= 2) {
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+                    Serial.println("CONFIG: find-me uses WS2812 strip (set_find_me_output ignored)");
+#else
                     config_set_find_me_output(message.data[1]);
                     config_get_find_me_output(&find_me_output_index);
                     Serial.printf("CONFIG: find-me output index set to %u\n", (unsigned)find_me_output_index);
+#endif
+                } else if (cmd == CMD_SET_CAN_LINK_INDICATOR && message.data_length_code >= 2) {
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+                    if (message.data[1] == WS2812_GPIO) {
+                        Serial.printf("CONFIG: reject CAN link GPIO %u (WS2812 data pin)\n", (unsigned)WS2812_GPIO);
+                    } else
+#endif
+                    config_set_can_link_indicator_gpio(message.data[1]);
+                    config_get_can_link_indicator_gpio(&can_link_indicator_gpio);
+                    Serial.printf("CONFIG: CAN link indicator GPIO set to %u\n", (unsigned)can_link_indicator_gpio);
+                } else if (cmd == CMD_SET_NIGHT_LIGHT && message.data_length_code >= 3) {
+                    uint8_t enabled = message.data[1] ? 1 : 0;
+                    uint8_t brightness = message.data[2];
+                    if (brightness > 100) brightness = 100;
+                    config_set_night_light(enabled != 0, brightness);
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+                    ws2812_request_night_light(enabled != 0, brightness);
+#endif
+                    Serial.printf("CONFIG: night light %s brightness=%u\n", enabled ? "on" : "off", (unsigned)brightness);
+                } else if (cmd == CMD_SET_WS2812_CLICK_EFFECT && message.data_length_code >= 2) {
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+                    uint8_t effect = message.data[1] ? WS2812_CLICK_EFFECT_CHASE : WS2812_CLICK_EFFECT_STROBE;
+                    config_set_ws2812_click_effect(effect);
+                    ws2812_post_set_click_effect(effect);
+                    Serial.printf("CONFIG: WS2812 click effect %s (stored)\n", effect ? "chase" : "strobe");
+#endif
+                } else if (cmd == CMD_SET_WS2812_EFFECT_PARAMS && message.data_length_code >= 7) {
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+                    const uint8_t effect_id = message.data[1];
+                    const uint8_t r = message.data[2];
+                    const uint8_t g = message.data[3];
+                    const uint8_t b = message.data[4];
+                    const uint16_t timing_ms =
+                        (uint16_t)message.data[5] | ((uint16_t)message.data[6] << 8);
+                    config_set_ws2812_effect_params(effect_id, r, g, b, timing_ms);
+                    ws2812_post_set_effect_params(effect_id, r, g, b, timing_ms);
+                    Serial.printf("CONFIG: WS2812 effect params id=%u rgb=%u,%u,%u timing=%u ms (stored)\n",
+                                  (unsigned)effect_id, (unsigned)r, (unsigned)g, (unsigned)b,
+                                  (unsigned)timing_ms);
+#endif
+                } else if (cmd == CMD_SET_TIMEZONE && message.data_length_code >= 2) {
+                    // Hub sends TZ string (IANA name) in multi-frame form: data[1]=total_len or 0xFF, data[2..7]=6 chars.
+                    // Convert known IANA zones to POSIX TZ strings understood by newlib so localtime() shows correct local time.
+                    static uint8_t tz_len = 0, tz_pos = 0;
+                    static char tz_buf[41];
+                    uint8_t seg = message.data[1];
+                    if (seg != 0xFF) {
+                        tz_len = (seg <= 40) ? seg : 40;
+                        tz_pos = 0;
+                    }
+                    size_t avail = (message.data_length_code >= 2) ? (size_t)(message.data_length_code - 2) : 0;
+                    if (avail > 6) avail = 6;
+                    for (size_t i = 0; i < avail && tz_pos < sizeof(tz_buf) - 1; i++) {
+                        tz_buf[tz_pos++] = (char)message.data[2 + i];
+                    }
+                    tz_buf[tz_pos] = '\0';
+                    if (tz_len > 0 && tz_pos >= tz_len) {
+                        tz_buf[tz_len] = '\0';
+
+                        const char* posix_tz = nullptr;
+                        if (strcmp(tz_buf, "Australia/Sydney") == 0) {
+                            // AEST (UTC+10) with AEDT DST, rules: M10.1.0,M4.1.0/3
+                            posix_tz = "AEST-10AEDT,M10.1.0,M4.1.0/3";
+                        } else if (strcmp(tz_buf, "UTC") == 0) {
+                            posix_tz = "UTC0";
+                        }
+
+                        const char* final_tz = posix_tz ? posix_tz : "UTC0";
+                        setenv("TZ", final_tz, 1);
+                        tzset();
+                        Serial.printf("CONFIG: timezone set from hub '%s' mapped to '%s'\n", tz_buf, final_tz);
+
+                        tz_pos = 0;
+                        tz_len = 0;
+                    }
                 } else if (cmd == CMD_SET_DATETIME && message.data_length_code >= 5) {
-                    // Hub sends Unix timestamp every hour; set node RTC so status bar shows date/time
+                    // Hub sends UTC Unix timestamp; LCD uses TZ from CMD_SET_TIMEZONE so localtime() shows local time
                     uint32_t ts = (uint32_t)message.data[1] | ((uint32_t)message.data[2] << 8)
                         | ((uint32_t)message.data[3] << 16) | ((uint32_t)message.data[4] << 24);
                     if (ts > 0) {
@@ -480,7 +666,6 @@ void handle_can_messages() {
 #if defined(NODE_ROLE_LCD)
             ui_set_can_connected(true);
 #endif
-        }
     }
 }
 
@@ -505,46 +690,111 @@ static void can_poll_task(void* arg) {
 #else
     node_type = NODE_TYPE_LCD;  // default
 #endif
-    
+
+    can_send_node_announce(cfg.node_id, node_type, cfg.input_count);
+    last_heartbeat_ms = millis();
+
     for (;;) {
         handle_can_messages();
-        input_engine_update();
+        unsigned long now_ms = millis();
+#if defined(NODE_ROLE_MIN)
+        node_ota_service(now_ms);
+        const bool ota_active = node_ota_is_active();
+#else
+        const bool ota_active = false;
+#endif
+        if (!ota_active) {
+            input_engine_update();
 
 #if defined(NODE_ROLE_MIN)
-        // Mechanical node: read GPIOs and feed levels into input engine (button-to-GND = active when LOW)
+        // Mechanical node: active low = pull-up + LOW pressed; active high = pull-down + HIGH (not all GPIOs have internal pull-down)
         for (uint8_t i = 0; i < cfg.input_count && i < MAX_INPUTS_PER_NODE; i++) {
-            if (cfg.input_gpio[i] != 0xFF) {
-                pinMode(cfg.input_gpio[i], INPUT_PULLUP);
-                bool active = (digitalRead(cfg.input_gpio[i]) == LOW);
+            uint8_t gpio = cfg.input_gpio[i];
+            if (gpio == 0xFF) {
+                gpio = (uint8_t)(i + 1);
+            }
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+            if (gpio == WS2812_GPIO)
+                continue;
+#endif
+            if (gpio != 0xFF) {
+                bool active;
+                if (cfg.input_active_high[i]) {
+                    pinMode(gpio, INPUT_PULLDOWN);
+                    active = (digitalRead(gpio) == HIGH);
+                } else {
+                    pinMode(gpio, INPUT_PULLUP);
+                    active = (digitalRead(gpio) == LOW);
+                }
                 input_engine_process_level(cfg.inputs[i].input_id, active);
             }
         }
 #endif
-
-        // Send periodic HEARTBEAT every 15 seconds
-        unsigned long now_ms = millis();
-        if (now_ms - last_heartbeat_ms >= 15000) {
-            can_send_node_announce(cfg.node_id, node_type, cfg.input_count);
-            last_heartbeat_ms = now_ms;
         }
+
+#if defined(NODE_ROLE_MIN)
+        // Send periodic HEARTBEAT every 15 seconds (skip while OTA receiving).
+        if (!ota_active) {
+#endif
+        if (last_heartbeat_ms == 0) {
+            last_heartbeat_ms = now_ms;
+        } else {
+            long elapsed = (long)(now_ms - last_heartbeat_ms);
+            if (elapsed < 0 || elapsed > 60000) {
+                last_heartbeat_ms = now_ms;
+            } else if (elapsed >= 15000) {
+                can_send_node_announce(cfg.node_id, node_type, cfg.input_count);
+                last_heartbeat_ms = now_ms;
+            }
+        }
+#if defined(NODE_ROLE_MIN)
+        }
+#endif
         
-        // Find-me: turn off after duration, or blink for non-zero I/O index (ESP32-S3 GPIO)
-        if (find_me_until && now_ms >= find_me_until) {
+        // Find-me: GPIO blink (non-WS2812 nodes only; WS2812 uses strip driver)
+#if !(defined(WS2812_ENABLE) && WS2812_ENABLE)
+        if (!ota_active && find_me_until && now_ms >= find_me_until) {
             if (find_me_output_index <= FIND_ME_GPIO_MAX)
                 digitalWrite(find_me_output_index, LOW);
             find_me_until = 0;
             find_me_last_toggle_ms = 0;
-        } else if (find_me_until && find_me_output_index != 0 && find_me_output_index <= FIND_ME_GPIO_MAX) {
+        } else if (!ota_active && find_me_until && find_me_output_index != 0 && find_me_output_index <= FIND_ME_GPIO_MAX) {
             if (find_me_last_toggle_ms == 0 || (now_ms - find_me_last_toggle_ms) >= FIND_ME_BLINK_INTERVAL_MS) {
                 find_me_blink_high = !find_me_blink_high;
                 digitalWrite(find_me_output_index, find_me_blink_high ? HIGH : LOW);
                 find_me_last_toggle_ms = now_ms;
             }
         }
+#endif
+
+#if defined(NODE_ROLE_MIN)
+        // CAN link indicator: solid = good link, flashing = bad/no link (mechanical node only)
+        if (can_link_indicator_gpio != 0xFF && can_link_indicator_gpio <= FIND_ME_GPIO_MAX
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+            && can_link_indicator_gpio != WS2812_GPIO
+#endif
+            ) {
+            static unsigned long can_link_last_toggle_ms = 0;
+            static bool can_link_blink_high = false;
+            const unsigned long CAN_LINK_BLINK_MS = 500;
+            bool link_ok = (now_ms - s_last_hub_to_node_rx_ms <= HUB_LINK_THRESHOLD_MS);
+            pinMode(can_link_indicator_gpio, OUTPUT);
+            if (link_ok) {
+                digitalWrite(can_link_indicator_gpio, HIGH);  // solid on = good link
+                can_link_last_toggle_ms = 0;
+            } else {
+                if (can_link_last_toggle_ms == 0 || (now_ms - can_link_last_toggle_ms) >= CAN_LINK_BLINK_MS) {
+                    can_link_blink_high = !can_link_blink_high;
+                    digitalWrite(can_link_indicator_gpio, can_link_blink_high ? HIGH : LOW);
+                    can_link_last_toggle_ms = now_ms;
+                }
+            }
+        }
+#endif
 
 #if defined(NODE_ROLE_LCD)
-        // CAN indicator dot: green when connected, red flashing when disconnected
-        bool connected = (now_ms - s_last_can_rx_ms <= CAN_STATUS_IDLE_MS);
+        // CAN indicator dot: green when connected, red flashing when disconnected (hub-to-node traffic within 30s)
+        bool connected = (now_ms - s_last_hub_to_node_rx_ms <= HUB_LINK_THRESHOLD_MS);
         ui_set_can_connected(connected);
 #endif
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -552,6 +802,10 @@ static void can_poll_task(void* arg) {
 }
 
 void loop() {
-    // CAN polling and input engine run in can_poll_task
+#if defined(NODE_ROLE_MIN) && defined(WS2812_ENABLE) && WS2812_ENABLE
+    // WS2812 runs on dedicated FreeRTOS task (ws2812_start_task).
     delay(100);
+#else
+    delay(100);
+#endif
 }

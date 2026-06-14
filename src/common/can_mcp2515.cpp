@@ -1,11 +1,13 @@
 /**
- * MCP2515 CAN adapter implementation (mechanical node / XIAO CAN board).
- * Uses autowp/arduino-mcp2515; converts to TWAI-style read/write/getStatus.
+ * MCP2515 CAN adapter — ESP-IDF spi_master + esp32-mcp2515 component.
  */
 #include "can_mcp2515.h"
-#include <mcp2515.h>
+
+extern "C" {
+#include "mcp2515.h"
+}
+
 #include <string.h>
-#include <Arduino.h>
 
 MCP2515CANAdapter::MCP2515CANAdapter() : m_initialized(false), m_impl(nullptr) {}
 
@@ -13,16 +15,17 @@ MCP2515CANAdapter::~MCP2515CANAdapter() {
   stop();
 }
 
-esp_err_t MCP2515CANAdapter::begin(int cs_pin) {
+esp_err_t MCP2515CANAdapter::begin(spi_device_handle_t* spi_handle) {
   if (m_initialized) return ESP_ERR_INVALID_STATE;
-  MCP2515 *mcp = new MCP2515((uint8_t)cs_pin);
+  if (!spi_handle) return ESP_ERR_INVALID_ARG;
+  MCP2515* mcp = new MCP2515(spi_handle);
   m_impl = mcp;
   if (mcp->reset() != MCP2515::ERROR_OK) {
     delete mcp;
     m_impl = nullptr;
     return ESP_ERR_INVALID_STATE;
   }
-  if (mcp->setBitrate(CAN_500KBPS) != MCP2515::ERROR_OK) {
+  if (mcp->setBitrate(CAN_500KBPS, MCP_16MHZ) != MCP2515::ERROR_OK) {
     delete mcp;
     m_impl = nullptr;
     return ESP_ERR_INVALID_STATE;
@@ -38,7 +41,7 @@ esp_err_t MCP2515CANAdapter::begin(int cs_pin) {
 
 esp_err_t MCP2515CANAdapter::stop() {
   if (!m_initialized) return ESP_OK;
-  MCP2515 *mcp = (MCP2515 *)m_impl;
+  MCP2515* mcp = (MCP2515*)m_impl;
   delete mcp;
   m_impl = nullptr;
   m_initialized = false;
@@ -47,10 +50,10 @@ esp_err_t MCP2515CANAdapter::stop() {
 
 esp_err_t MCP2515CANAdapter::write(can::FrameType extd, uint32_t identifier, uint8_t length, uint8_t *buffer) {
   if (!m_initialized || !m_impl) return ESP_ERR_INVALID_STATE;
-  MCP2515 *mcp = (MCP2515 *)m_impl;
+  MCP2515* mcp = (MCP2515*)m_impl;
   struct can_frame f;
   memset(&f, 0, sizeof(f));
-  f.can_id = identifier & 0x7FF;  // 11-bit standard
+  f.can_id = identifier & 0x7FF;
   if (extd == can::FrameType::EXTD_FRAME)
     f.can_id |= CAN_EFF_FLAG;
   f.can_dlc = length > 8 ? 8 : length;
@@ -64,7 +67,7 @@ esp_err_t MCP2515CANAdapter::write(can::FrameType extd, uint32_t identifier, uin
 
 esp_err_t MCP2515CANAdapter::read(twai_message_t *ptr_message) {
   if (!m_initialized || !m_impl || !ptr_message) return ESP_ERR_INVALID_ARG;
-  MCP2515 *mcp = (MCP2515 *)m_impl;
+  MCP2515* mcp = (MCP2515*)m_impl;
   if (!mcp->checkReceive()) return ESP_ERR_NOT_FOUND;
   struct can_frame f;
   memset(&f, 0, sizeof(f));
@@ -86,7 +89,7 @@ twai_status_info_t MCP2515CANAdapter::getStatus() const {
     return st;
   }
   st.state = TWAI_STATE_RUNNING;
-  st.msgs_to_rx = ((MCP2515 *)m_impl)->checkReceive() ? 1 : 0;
+  st.msgs_to_rx = ((MCP2515*)m_impl)->checkReceive() ? 1 : 0;
   return st;
 }
 

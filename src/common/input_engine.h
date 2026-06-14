@@ -27,6 +27,10 @@ void input_engine_process_level(uint8_t input_id, bool active_now);
 // Periodic update - call this regularly to check for pending click timeouts
 void input_engine_update(void);
 
+// Optional callback after a short-press event is sent (CLICK or DOUBLE_CLICK)
+typedef void (*input_engine_event_fn)(uint8_t input_id, uint8_t event_code);
+void input_engine_set_event_callback(input_engine_event_fn fn);
+
 #ifdef __cplusplus
 }
 #endif

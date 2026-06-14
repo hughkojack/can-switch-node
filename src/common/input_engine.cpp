@@ -1,7 +1,15 @@
 #include "input_engine.h"
 #include "can.h"
 #include "config_store.h"
+#include "platform_time.h"
+#include <esp_log.h>
+
+#ifdef ARDUINO
 #include <Arduino.h>
+#define LOGI(fmt, ...) Serial.printf(fmt, ##__VA_ARGS__)
+#else
+#define LOGI(fmt, ...) ESP_LOGI("input_engine", fmt, ##__VA_ARGS__)
+#endif
 
 // Compile-time defaults (overridden by config when timing_nvs provided)
 #define CLICK_MAX_DURATION_MS     500
@@ -30,7 +38,13 @@ typedef struct {
   bool click_pending;               // Whether we have a pending click waiting for double-click window
 } input_state_t;
 
-static input_state_t g_state[256] = {0};
+static input_state_t g_state[256] = {};
+static input_engine_event_fn g_event_cb = nullptr;
+
+static void notify_event(uint8_t input_id, uint8_t event_code) {
+  if (g_event_cb)
+    g_event_cb(input_id, event_code);
+}
 
 static const input_cfg_t* find_cfg(uint8_t input_id) {
   for (uint8_t i = 0; i < g_cfg_count; i++) {
@@ -72,12 +86,11 @@ void input_engine_process_level(uint8_t input_id, bool active_now) {
   
   const input_cfg_t* c = find_cfg(input_id);
   if (!c) {
-    Serial.println("ENGINE: no cfg match -> NOT SENDING");
     return;
   }
 
   input_state_t* state = &g_state[input_id];
-  unsigned long now = millis();
+  unsigned long now = platform_millis();
 
   // Handle state changes
   if (state->last_active == active_now) {
@@ -87,13 +100,13 @@ void input_engine_process_level(uint8_t input_id, bool active_now) {
       if (press_duration >= (unsigned long)g_long_hold_min_ms && !state->long_hold_sent) {
         can_send_long_hold(g_node_id, input_id);
         state->long_hold_sent = true;
-        Serial.printf("ENGINE: input_id=%u LONG_HOLD\n", input_id);
+        LOGI("ENGINE: input_id=%u LONG_HOLD\n", input_id);
         // Cancel any pending click
         state->click_pending = false;
       } else if (press_duration >= (unsigned long)g_hold_min_ms) {
         can_send_hold(g_node_id, input_id);
         state->hold_sent = true;
-        Serial.printf("ENGINE: input_id=%u HOLD\n", input_id);
+        LOGI("ENGINE: input_id=%u HOLD\n", input_id);
         // Cancel any pending click
         state->click_pending = false;
       }
@@ -108,7 +121,8 @@ void input_engine_process_level(uint8_t input_id, bool active_now) {
     if (state->click_pending && (now - state->pending_click_time) <= (unsigned long)g_double_click_gap_ms) {
       // Double click detected!
       can_send_double_click(g_node_id, input_id);
-      Serial.printf("ENGINE: input_id=%u DOUBLE_CLICK\n", input_id);
+      notify_event(input_id, EVT_DOUBLE_CLICK);
+      LOGI("ENGINE: input_id=%u DOUBLE_CLICK\n", input_id);
       state->click_pending = false;
       state->pending_click_time = 0;
     }
@@ -128,7 +142,7 @@ void input_engine_process_level(uint8_t input_id, bool active_now) {
       // Hold was already sent during press, or send it now if missed
       if (!state->hold_sent) {
         can_send_hold(g_node_id, input_id);
-        Serial.printf("ENGINE: input_id=%u HOLD (on release)\n", input_id);
+        LOGI("ENGINE: input_id=%u HOLD (on release)\n", input_id);
       }
       // Reset click tracking
       state->click_pending = false;
@@ -143,7 +157,7 @@ void input_engine_process_level(uint8_t input_id, bool active_now) {
 }
 
 void input_engine_update(void) {
-  unsigned long now = millis();
+  unsigned long now = platform_millis();
   
   // Check all inputs for pending click timeouts (use int so loop terminates at 256)
   for (int i = 0; i < 256; i++) {
@@ -154,10 +168,15 @@ void input_engine_update(void) {
       if (c) {
         // Timeout - send the single click
         can_send_click(g_node_id, i);
-        Serial.printf("ENGINE: input_id=%u CLICK (timeout)\n", i);
+        notify_event(i, EVT_CLICK);
+        LOGI("ENGINE: input_id=%u CLICK (timeout)\n", i);
         state->click_pending = false;
         state->pending_click_time = 0;
       }
     }
   }
+}
+
+void input_engine_set_event_callback(input_engine_event_fn fn) {
+  g_event_cb = fn;
 }
