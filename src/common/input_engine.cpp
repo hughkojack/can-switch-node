@@ -17,7 +17,7 @@
 #define HOLD_MIN_DURATION_MS      800
 #define LONG_HOLD_MIN_DURATION_MS 2000
 
-static uint8_t g_node_id = 0;
+static const uint8_t* g_node_id_ptr = nullptr;
 static const input_cfg_t* g_cfg = nullptr;
 static uint8_t g_cfg_count = 0;
 
@@ -53,8 +53,12 @@ static const input_cfg_t* find_cfg(uint8_t input_id) {
   return nullptr;
 }
 
-void input_engine_init(uint8_t node_id, const input_cfg_t* cfg, uint8_t cfg_count, const void* timing_nvs) {
-  g_node_id = node_id;
+static uint8_t can_node_id(void) {
+  return g_node_id_ptr ? *g_node_id_ptr : 0;
+}
+
+void input_engine_init(const uint8_t* node_id_ptr, const input_cfg_t* cfg, uint8_t cfg_count, const void* timing_nvs) {
+  g_node_id_ptr = node_id_ptr;
   g_cfg = cfg;
   g_cfg_count = cfg_count;
 
@@ -98,13 +102,13 @@ void input_engine_process_level(uint8_t input_id, bool active_now) {
     if (active_now && !state->hold_sent) {
       unsigned long press_duration = now - state->press_time;
       if (press_duration >= (unsigned long)g_long_hold_min_ms && !state->long_hold_sent) {
-        can_send_long_hold(g_node_id, input_id);
+        can_send_long_hold(can_node_id(), input_id);
         state->long_hold_sent = true;
         LOGI("ENGINE: input_id=%u LONG_HOLD\n", input_id);
         // Cancel any pending click
         state->click_pending = false;
       } else if (press_duration >= (unsigned long)g_hold_min_ms) {
-        can_send_hold(g_node_id, input_id);
+        can_send_hold(can_node_id(), input_id);
         state->hold_sent = true;
         LOGI("ENGINE: input_id=%u HOLD\n", input_id);
         // Cancel any pending click
@@ -120,7 +124,7 @@ void input_engine_process_level(uint8_t input_id, bool active_now) {
     // Check if this is a second press within double-click window
     if (state->click_pending && (now - state->pending_click_time) <= (unsigned long)g_double_click_gap_ms) {
       // Double click detected!
-      can_send_double_click(g_node_id, input_id);
+      can_send_double_click(can_node_id(), input_id);
       notify_event(input_id, EVT_DOUBLE_CLICK);
       LOGI("ENGINE: input_id=%u DOUBLE_CLICK\n", input_id);
       state->click_pending = false;
@@ -141,7 +145,7 @@ void input_engine_process_level(uint8_t input_id, bool active_now) {
     if (press_duration >= (unsigned long)g_hold_min_ms) {
       // Hold was already sent during press, or send it now if missed
       if (!state->hold_sent) {
-        can_send_hold(g_node_id, input_id);
+        can_send_hold(can_node_id(), input_id);
         LOGI("ENGINE: input_id=%u HOLD (on release)\n", input_id);
       }
       // Reset click tracking
@@ -167,7 +171,7 @@ void input_engine_update(void) {
       const input_cfg_t* c = find_cfg(i);
       if (c) {
         // Timeout - send the single click
-        can_send_click(g_node_id, i);
+        can_send_click(can_node_id(), i);
         notify_event(i, EVT_CLICK);
         LOGI("ENGINE: input_id=%u CLICK (timeout)\n", i);
         state->click_pending = false;

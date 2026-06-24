@@ -8,27 +8,21 @@
 extern "C" {
 #endif
 
-#define CAN_MSG_FIRMWARE         0x5
-#define CAN_MSG_FIRMWARE_STATUS  0x9
+#define CAN_MSG_OTA_REMOTE    0xE
+#define CAN_MSG_OTA_NODE      0xF
 
-#define FW_CMD_BEGIN  0x01
-#define FW_CMD_DATA   0x02
-#define FW_CMD_END    0x03
-#define FW_CMD_ABORT  0x04
-
-#define FW_BEGIN_PART0  0
-#define FW_BEGIN_PART1  1
-
-#define FW_STATUS_IDLE     0
-#define FW_STATUS_READY    1
-#define FW_STATUS_ACK      2
-#define FW_STATUS_NACK     3
-#define FW_STATUS_COMPLETE 4
-#define FW_STATUS_ERROR    5
-#define FW_STATUS_BUSY     6
-
-#define FW_DATA_BYTES_PER_FRAME  5
-#define FW_OTA_IDLE_TIMEOUT_MS   30000
+#define OTA_FLASH_READY      0x04
+#define OTA_FLASH_INIT       0x06
+#define OTA_FLASH_DATA       0x08
+#define OTA_FLASH_DATA_ERR   0x0D
+#define OTA_FLASH_DONE       0x10
+#define OTA_FLASH_COMPLETE   0x14
+#define OTA_FLASH_ERROR      0x15
+#define OTA_FLASH_ABORT      0x18
+#define OTA_DATA_BYTES_PER_FRAME  4
+#define OTA_SEGMENT_BYTES         4
+#define OTA_TRANSFER_BLOCK_BYTES  OTA_SEGMENT_BYTES
+#define FW_OTA_IDLE_TIMEOUT_MS   1800000
 
 #ifndef FW_VERSION
 #define FW_VERSION 0x0100
@@ -40,9 +34,14 @@ extern "C" {
 
 #if defined(NODE_ROLE_MIN)
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 void node_ota_set_node_id(uint8_t node_id);
+void node_ota_set_poll_task(TaskHandle_t task);
 bool node_ota_is_active(void);
 void node_ota_on_can_frame(const uint8_t* data, uint8_t dlc);
+void node_ota_drain_notifications(void);
 void node_ota_service(unsigned long now_ms);
 
 #else

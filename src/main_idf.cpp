@@ -57,7 +57,7 @@ static void on_input_click_flash(uint8_t input_id, uint8_t event_code) {
 #if defined(WS2812_ENABLE) && WS2812_ENABLE
 static void input_engine_reinit(void) {
   config_get_timing(&s_timing);
-  input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
+  input_engine_init(&cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
   input_engine_set_event_callback(on_input_click_flash);
 }
 #endif
@@ -100,11 +100,11 @@ static void handle_can_messages(void) {
 
     if (target_id == cfg.node_id) {
       if (msg_type == CAN_MSG_SENSOR_DATA || msg_type == CAN_MSG_NODE_CONFIG
-          || msg_type == CAN_MSG_STATE_FEEDBACK || msg_type == CAN_MSG_FIRMWARE)
+          || msg_type == CAN_MSG_STATE_FEEDBACK || msg_type == CAN_MSG_OTA_REMOTE)
         s_last_hub_to_node_rx_ms = platform_millis();
     }
 
-    if (msg_type == CAN_MSG_FIRMWARE && target_id == cfg.node_id && message.data_length_code >= 1) {
+    if (msg_type == CAN_MSG_OTA_REMOTE && target_id == cfg.node_id && message.data_length_code >= 3) {
       node_ota_on_can_frame(message.data, message.data_length_code);
     } else if (msg_type == CAN_MSG_NODE_CONFIG && target_id == cfg.node_id && message.data_length_code >= 1) {
       if (node_ota_is_active()) {
@@ -122,7 +122,7 @@ static void handle_can_messages(void) {
           input_engine_reinit();
 #else
           config_get_timing(&s_timing);
-          input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
+          input_engine_init(&cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
 #endif
           ESP_LOGI(TAG, "CONFIG: node_id set to %u", (unsigned)cfg.node_id);
         }
@@ -146,7 +146,7 @@ static void handle_can_messages(void) {
           input_engine_reinit();
 #else
           config_get_timing(&s_timing);
-          input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
+          input_engine_init(&cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
 #endif
           ESP_LOGI(TAG, "CONFIG: input[%u] id=%u gpio=%u", (unsigned)idx,
                    (unsigned)cfg.inputs[idx].input_id, (unsigned)cfg.input_gpio[idx]);
@@ -160,7 +160,7 @@ static void handle_can_messages(void) {
           input_engine_reinit();
 #else
           config_get_timing(&s_timing);
-          input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
+          input_engine_init(&cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
 #endif
           ESP_LOGI(TAG, "CONFIG: input_count set to %u", (unsigned)cfg.input_count);
         }
@@ -178,7 +178,7 @@ static void handle_can_messages(void) {
 #if defined(WS2812_ENABLE) && WS2812_ENABLE
         input_engine_reinit();
 #else
-        input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
+        input_engine_init(&cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
 #endif
       } else if (cmd == CMD_FIND_ME) {
         uint8_t duration_min = (message.data_length_code >= 2) ? message.data[1] : 5;
@@ -236,11 +236,13 @@ static void handle_can_messages(void) {
 
     s_last_can_rx_ms = platform_millis();
   }
+  node_ota_drain_notifications();
 }
 
 static void can_poll_task(void* arg) {
   (void)arg;
   vTaskDelay(pdMS_TO_TICKS(500));
+  node_ota_set_poll_task(xTaskGetCurrentTaskHandle());
 
   static uint32_t last_heartbeat_ms = 0;
 #if !(defined(WS2812_ENABLE) && WS2812_ENABLE)
@@ -254,8 +256,9 @@ static void can_poll_task(void* arg) {
   last_heartbeat_ms = platform_millis();
 
   for (;;) {
-    handle_can_messages();
     const uint32_t now_ms = platform_millis();
+    ulTaskNotifyTake(pdTRUE, 0);
+    handle_can_messages();
     node_ota_service(now_ms);
     const bool ota_active = node_ota_is_active();
 
@@ -338,7 +341,7 @@ static void can_poll_task(void* arg) {
       }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(ota_active ? 1 : 10));
   }
 }
 
@@ -367,7 +370,7 @@ extern "C" void app_main(void) {
 
   config_get_timing(&s_timing);
   config_get_can_link_indicator_gpio(&can_link_indicator_gpio);
-  input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
+  input_engine_init(&cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
 
   node_ota_set_node_id(cfg.node_id);
 #if defined(WS2812_ENABLE) && WS2812_ENABLE
@@ -376,5 +379,5 @@ extern "C" void app_main(void) {
   input_engine_set_event_callback(on_input_click_flash);
 
   can_send_node_announce(cfg.node_id, NODE_TYPE_MECHANICAL, cfg.input_count);
-  xTaskCreate(can_poll_task, "can_poll", 12288, NULL, 1, NULL);
+  xTaskCreate(can_poll_task, "can_poll", 12288, NULL, 5, NULL);
 }

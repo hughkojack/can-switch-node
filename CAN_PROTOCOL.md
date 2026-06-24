@@ -14,9 +14,9 @@ This document describes the CAN frame layout and commands so hub firmware (and w
 | Input event | 0x1 | Node → Hub | Button/input events (see `can.h` event codes) |
 | Node config  | 0x3 | Hub → Node | Configuration commands (see below) |
 | State feedback | 0x4 | Hub → Node | Per-button brightness for LCD (4 bytes 0–100 or 0xFF) |
-| Firmware | 0x5 | Hub → Node | OTA transfer (FW_BEGIN / FW_DATA / FW_END / FW_ABORT) |
+| Firmware | 0xE | Hub → Node | OTA remote commands (`CAN_OTA_REMOTE`) |
+| OTA node | 0xF | Node → Hub | OTA responses (`CAN_OTA_NODE`; wins arbitration) |
 | Node announce| 0x8 | Node → Hub | Heartbeat/announce (node_id, type, input_count, fw version) |
-| Firmware status | 0x9 | Node → Hub | OTA ACK / NACK / progress |
 
 ## Unconfigured node (127)
 
@@ -58,9 +58,24 @@ This document describes the CAN frame layout and commands so hub firmware (and w
   - Bytes 2–3 (DLC ≥ 5): **fw_version** uint16 LE (e.g. `0x0100` = v1.0).
   - Byte 4 (DLC ≥ 5): **ota_capable** — `1` if node accepts CAN OTA.
 
-## Hub → Node: CAN_MSG_FIRMWARE (0x5) / Node → Hub: CAN_MSG_FIRMWARE_STATUS (0x9)
+## CAN OTA: CAN_MSG_OTA_REMOTE (0xE) / CAN_MSG_OTA_NODE (0xF)
 
-CAN OTA for mechanical nodes (`node_min_c3`). Full specification: hub repo `docs/CAN_OTA.md`. Bench script: `tools/can_ota_bench.py`.
+Node-paced OTA for mechanical nodes (`node_min_c3`). **Full guide:** [docs/CAN_OTA.md](docs/CAN_OTA.md). Bench script: [tools/can_ota_bench.py](tools/can_ota_bench.py).
+
+**8-byte payload** (both directions): `[node_id u16 BE][opcode][meta][data or offset u32 BE]`
+
+| Opcode | Value | Direction | Purpose |
+|--------|-------|-----------|---------|
+| `OTA_FLASH_READY` | `0x04` | Node → hub | Ready; bytes 4–7 = next write offset u32 BE |
+| `OTA_FLASH_INIT` | `0x06` | Hub → node | Start; bytes 4–7 = image size u32 BE |
+| `OTA_FLASH_DATA` | `0x08` | Hub → node | 1–4 bytes; byte 3 = `(len<<5)\|(offset&0x1F)` |
+| `OTA_FLASH_DATA_ERR` | `0x0D` | Node → hub | Offset mismatch; bytes 4–7 = expected offset |
+| `OTA_FLASH_DONE` | `0x10` | Hub → node | End; bytes 4–7 = CRC32 BE |
+| `OTA_FLASH_COMPLETE` | `0x14` | Node → hub | Success |
+| `OTA_FLASH_ERROR` | `0x15` | Node → hub | Failure; byte 4 = reason |
+| `OTA_FLASH_ABORT` | `0x18` | Either | Cancel |
+
+**v2 strict stop-and-wait:** `OTA_SEGMENT_BYTES` = 4. Hub sends one `FLASH_DATA` frame (up to 4 bytes), then waits for `FLASH_READY` with **exact** offset `previous + len`. Node sends `READY` only after `esp_ota_write` completes; while a flash write is pending, incoming `DATA` is ignored (no busy `READY`). Offset mismatch → node sends `FLASH_DATA_ERR` with expected offset; hub resends from that offset. `READY` ahead of expected offset → hub aborts (desync). Tune segment size later via `OTA_SEGMENT_BYTES` (one `READY` per segment).
 
 ## Node types
 
@@ -86,9 +101,9 @@ CAN OTA for mechanical nodes (`node_min_c3`). Full specification: hub repo `docs
 #define CAN_MSG_INPUT_EVENT   0x1
 #define CAN_MSG_NODE_CONFIG   0x3
 #define CAN_MSG_STATE_FEEDBACK 0x4
-#define CAN_MSG_FIRMWARE       0x5
+#define CAN_MSG_OTA_REMOTE    0xE
+#define CAN_MSG_OTA_NODE      0xF
 #define CAN_MSG_NODE_ANNOUNCE 0x8
-#define CAN_MSG_FIRMWARE_STATUS 0x9
 #define CMD_SET_NODE_ID        0x01
 #define CMD_SET_INPUT_CFG     0x02
 #define CMD_SET_INPUT_COUNT   0x03
@@ -96,6 +111,7 @@ CAN OTA for mechanical nodes (`node_min_c3`). Full specification: hub repo `docs
 #define CMD_FIND_ME           0x05
 #define CMD_SET_FIND_ME_OUTPUT 0x06
 #define CMD_SET_INPUT_LABEL   0x07
+#define CMD_REBOOT            0x09
 #define NODE_TYPE_LCD         1
 #define NODE_TYPE_MECHANICAL   2
 #define CMD_SET_NIGHT_LIGHT       0x0C

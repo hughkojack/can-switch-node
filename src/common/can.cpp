@@ -1,6 +1,10 @@
 #include "can.h"
 #include "can_driver.h"
 
+#if defined(NODE_ROLE_MIN)
+#include "node_ota.h"
+#endif
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -16,6 +20,11 @@ uint16_t can_id(uint8_t msg_type, uint8_t node_id) {
 }
 
 static inline bool can_send_raw(uint16_t id, const uint8_t *data, uint8_t dlc) {
+#if defined(NODE_ROLE_MIN)
+  const uint8_t msg_type = (uint8_t)((id >> 7) & 0x0F);
+  if (node_ota_is_active() && msg_type == CAN_MSG_INPUT_EVENT)
+    return true;
+#endif
   esp_err_t r = CAN.write(can::FrameType::STD_FRAME, id, dlc, (uint8_t*)data);
 #if defined(CAN_DEBUG_SERIAL)
   const uint8_t msg_type = (uint8_t)((id >> 7) & 0x0F);
@@ -91,15 +100,6 @@ bool can_send_node_announce_ex(uint8_t node_id, uint8_t node_type, uint8_t input
   return can_send_raw(can_id(CAN_MSG_NODE_ANNOUNCE, node_id), d, 5);
 }
 
-bool can_send_firmware_status(uint8_t node_id, uint8_t status, uint16_t seq, uint32_t extra) {
-  uint8_t d[7] = {
-    status,
-    (uint8_t)(seq & 0xFF),
-    (uint8_t)((seq >> 8) & 0xFF),
-    (uint8_t)(extra & 0xFF),
-    (uint8_t)((extra >> 8) & 0xFF),
-    (uint8_t)((extra >> 16) & 0xFF),
-    (uint8_t)((extra >> 24) & 0xFF),
-  };
-  return can_send_raw(can_id(CAN_MSG_FIRMWARE_STATUS, node_id), d, 7);
+bool can_send_ota_node(uint8_t node_id, const uint8_t data[8]) {
+  return can_send_raw(can_id(CAN_MSG_OTA_NODE, node_id), data, 8);
 }

@@ -2,6 +2,8 @@
 """
 Bench-test CAN OTA against a mechanical node (node_min_c3) via python-can.
 
+Uses mcp-can-boot-style node-paced protocol (CAN_OTA_REMOTE / CAN_OTA_NODE).
+
 Usage:
   pip install python-can
   python tools/can_ota_bench.py --interface socketcan --channel can0 --node-id 4 firmware.bin
@@ -17,6 +19,10 @@ import argparse
 import struct
 import sys
 import time
+import socket
+import urllib.parse
+import urllib.request
+import json
 import zlib
 
 try:
@@ -25,23 +31,18 @@ except ImportError:
     print("Install python-can: pip install python-can", file=sys.stderr)
     sys.exit(1)
 
-FW_CMD_BEGIN = 0x01
-FW_CMD_DATA = 0x02
-FW_CMD_END = 0x03
-FW_CMD_ABORT = 0x04
-FW_BEGIN_PART0 = 0
-FW_BEGIN_PART1 = 1
-FW_DATA_BYTES = 5
+OTA_FLASH_READY = 0x04
+OTA_FLASH_INIT = 0x06
+OTA_FLASH_DATA = 0x08
+OTA_FLASH_DATA_ERR = 0x0D
+OTA_FLASH_DONE = 0x10
+OTA_FLASH_COMPLETE = 0x14
+OTA_FLASH_ERROR = 0x15
+OTA_FLASH_ABORT = 0x18
+OTA_DATA_BYTES = 4
 
-FW_STATUS_READY = 1
-FW_STATUS_ACK = 2
-FW_STATUS_NACK = 3
-FW_STATUS_COMPLETE = 4
-FW_STATUS_ERROR = 5
-
-CAN_MSG_FIRMWARE = 0x5
-CAN_MSG_FIRMWARE_STATUS = 0x9
-ACK_WINDOW = 16
+CAN_MSG_OTA_REMOTE = 0xE
+CAN_MSG_OTA_NODE = 0xF
 
 
 def can_id(msg_type: int, node_id: int) -> int:
@@ -52,84 +53,208 @@ def crc32(data: bytes) -> int:
     return zlib.crc32(data) & 0xFFFFFFFF
 
 
-def send_begin(bus: can.Bus, node_id: int, size: int, crc: int, version: int) -> None:
-    p0 = bytes([
-        FW_CMD_BEGIN, FW_BEGIN_PART0,
-        size & 0xFF, (size >> 8) & 0xFF, (size >> 16) & 0xFF, (size >> 24) & 0xFF,
-        crc & 0xFF,
+def build_frame(node_id: int, opcode: int, meta: int = 0, tail: bytes = b"\x00\x00\x00\x00") -> bytes:
+    if len(tail) != 4:
+        raise ValueError("tail must be 4 bytes")
+    return bytes([
+        (node_id >> 8) & 0xFF,
+        node_id & 0xFF,
+        opcode,
+        meta & 0xFF,
+        tail[0], tail[1], tail[2], tail[3],
     ])
-    p1 = bytes([
-        FW_CMD_BEGIN, FW_BEGIN_PART1,
-        crc & 0xFF, (crc >> 8) & 0xFF, (crc >> 16) & 0xFF, (crc >> 24) & 0xFF,
-        version & 0xFF, (version >> 8) & 0xFF,
-    ])
-    bus.send(can.Message(arbitration_id=can_id(CAN_MSG_FIRMWARE, node_id), data=p0, is_extended_id=False))
-    bus.send(can.Message(arbitration_id=can_id(CAN_MSG_FIRMWARE, node_id), data=p1, is_extended_id=False))
 
 
-def send_data(bus: can.Bus, node_id: int, seq: int, chunk: bytes) -> None:
-    payload = bytes([FW_CMD_DATA, seq & 0xFF, (seq >> 8) & 0xFF]) + chunk
-    bus.send(can.Message(arbitration_id=can_id(CAN_MSG_FIRMWARE, node_id), data=payload, is_extended_id=False))
+def read_offset_be(data: bytes) -> int:
+    return struct.unpack(">I", data[4:8])[0]
 
 
-def send_end(bus: can.Bus, node_id: int, crc: int) -> None:
-    payload = bytes([FW_CMD_END, crc & 0xFF, (crc >> 8) & 0xFF, (crc >> 16) & 0xFF, (crc >> 24) & 0xFF])
-    bus.send(can.Message(arbitration_id=can_id(CAN_MSG_FIRMWARE, node_id), data=payload, is_extended_id=False))
+def send_remote(bus: can.Bus, node_id: int, frame: bytes) -> None:
+    bus.send(can.Message(arbitration_id=can_id(CAN_MSG_OTA_REMOTE, node_id), data=frame, is_extended_id=False))
+
+
+def send_init(bus: can.Bus, node_id: int, size: int) -> None:
+    send_remote(bus, node_id, build_frame(node_id, OTA_FLASH_INIT, 0, struct.pack(">I", size)))
+
+
+def send_data(bus: can.Bus, node_id: int, offset: int, chunk: bytes) -> None:
+    n = len(chunk)
+    meta = ((n & 0x07) << 5) | (offset & 0x1F)
+    tail = chunk + b"\x00" * (4 - n)
+    send_remote(bus, node_id, build_frame(node_id, OTA_FLASH_DATA, meta, tail))
+
+
+def send_done(bus: can.Bus, node_id: int, crc: int) -> None:
+    send_remote(bus, node_id, build_frame(node_id, OTA_FLASH_DONE, 0, struct.pack(">I", crc)))
 
 
 def send_abort(bus: can.Bus, node_id: int, reason: int = 1) -> None:
-    bus.send(can.Message(
-        arbitration_id=can_id(CAN_MSG_FIRMWARE, node_id),
-        data=bytes([FW_CMD_ABORT, reason]),
-        is_extended_id=False,
-    ))
+    send_remote(bus, node_id, build_frame(node_id, OTA_FLASH_ABORT, 0, bytes([reason, 0, 0, 0])))
 
 
-def wait_status(bus: can.Bus, node_id: int, expect: int, timeout: float = 5.0) -> tuple[int, int]:
+def recv_node(bus: can.Bus, node_id: int, timeout: float = 5.0) -> tuple[int, bytes]:
     deadline = time.time() + timeout
     while time.time() < deadline:
         msg = bus.recv(timeout=0.2)
         if msg is None:
             continue
-        if msg.arbitration_id != can_id(CAN_MSG_FIRMWARE_STATUS, node_id):
+        if msg.arbitration_id != can_id(CAN_MSG_OTA_NODE, node_id):
             continue
-        if len(msg.data) < 3:
+        if len(msg.data) < 8:
             continue
-        status = msg.data[0]
-        seq = msg.data[1] | (msg.data[2] << 8)
-        if status == expect:
-            return status, seq
-        if status in (FW_STATUS_ERROR, FW_STATUS_NACK):
-            raise RuntimeError(f"node status={status} seq={seq}")
-    raise TimeoutError(f"timeout waiting for status {expect}")
+        return msg.data[2], bytes(msg.data)
+    raise TimeoutError("timeout waiting for node response")
 
 
-def run_ota(bus: can.Bus, node_id: int, image: bytes, version: int, do_abort: bool = False) -> None:
+def wait_ready(bus: can.Bus, node_id: int, timeout: float = 5.0) -> int:
+    while True:
+        opcode, data = recv_node(bus, node_id, timeout)
+        if opcode == OTA_FLASH_READY:
+            return read_offset_be(data)
+        if opcode == OTA_FLASH_DATA_ERR:
+            return read_offset_be(data)
+        if opcode == OTA_FLASH_ERROR:
+            reason = data[4] if len(data) > 4 else 0
+            raise RuntimeError(f"node FLASH_ERROR reason={reason}")
+        if opcode == OTA_FLASH_COMPLETE:
+            raise RuntimeError("unexpected FLASH_COMPLETE")
+
+
+def run_ota(
+    bus: can.Bus,
+    node_id: int,
+    image: bytes,
+    version: int,
+    do_abort: bool = False,
+    ready_timeout: float = 5.0,
+) -> None:
+    _ = version
     c = crc32(image)
-    print(f"Image size={len(image)} crc=0x{c:08X} version=0x{version:04X}")
-    send_begin(bus, node_id, len(image), c, version)
-    wait_status(bus, node_id, FW_STATUS_READY, timeout=5.0)
-    print("Node READY")
+    print(f"Image size={len(image)} crc=0x{c:08X}")
+    send_init(bus, node_id, len(image))
+    offset = wait_ready(bus, node_id, timeout=max(ready_timeout, 15.0))
+    print(f"Node READY offset={offset}")
 
     if do_abort:
         send_abort(bus, node_id)
-        print("Sent FW_ABORT (expect node to return to idle)")
+        print("Sent FLASH_ABORT (expect node to return to idle)")
         return
 
-    seq = 0
-    offset = 0
     while offset < len(image):
-        n = min(FW_DATA_BYTES, len(image) - offset)
-        send_data(bus, node_id, seq, image[offset:offset + n])
-        offset += n
-        seq += 1
-        if seq % ACK_WINDOW == 0 or offset >= len(image):
-            _, ack_seq = wait_status(bus, node_id, FW_STATUS_ACK, timeout=2.0)
-            print(f"  ACK seq={ack_seq} ({100 * offset // len(image)}%)")
+        n = min(OTA_DATA_BYTES, len(image) - offset)
+        chunk_offset = offset
+        send_data(bus, node_id, chunk_offset, image[chunk_offset:chunk_offset + n])
+        try:
+            new_offset = wait_ready(bus, node_id, timeout=ready_timeout)
+        except TimeoutError:
+            # Hub tunnel may drop a READY under load; one resend at same offset often recovers.
+            print(f"  timeout at offset={chunk_offset}, resending DATA once…")
+            send_data(bus, node_id, chunk_offset, image[chunk_offset:chunk_offset + n])
+            new_offset = wait_ready(bus, node_id, timeout=ready_timeout)
+        if new_offset < chunk_offset:
+            raise RuntimeError(f"node regressed at offset {chunk_offset} (got {new_offset})")
+        if new_offset == chunk_offset:
+            raise RuntimeError(f"stalled at offset {chunk_offset}")
+        offset = new_offset
+        if offset % 4096 < OTA_DATA_BYTES or offset >= len(image):
+            print(f"  offset={offset} ({100 * offset // len(image)}%)")
 
-    send_end(bus, node_id, c)
-    wait_status(bus, node_id, FW_STATUS_COMPLETE, timeout=10.0)
+    send_done(bus, node_id, c)
+    opcode, _ = recv_node(bus, node_id, timeout=15.0)
+    if opcode != OTA_FLASH_COMPLETE:
+        raise RuntimeError(f"expected FLASH_COMPLETE, got opcode=0x{opcode:02X}")
     print("OTA COMPLETE (reboot node via hub CMD_REBOOT or power cycle to run new image)")
+
+
+CAN_TUNNEL_MAGIC = b"\xCA\xFE"
+CAN_TUNNEL_FRAME_SIZE = 13
+CAN_TUNNEL_TCP_PORT = 5250
+
+
+class TunnelBus:
+    def __init__(self, hub_base: str, port: int = CAN_TUNNEL_TCP_PORT):
+        base = hub_base.rstrip("/")
+        if not base.startswith("http"):
+            base = "http://" + base
+        self._hub = base
+        self._port = port
+        self._sock = None
+        self._rx_buf = bytearray()
+        self._rx_queue: list[can.Message] = []
+
+    def _http_post(self, path: str) -> dict:
+        req = urllib.request.Request(self._hub + path, data=b"", method="POST")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+
+    def _connect_tcp(self) -> None:
+        parsed = urllib.parse.urlparse(self._hub)
+        host = parsed.hostname or "localhost"
+        self._sock = socket.create_connection((host, self._port), timeout=30)
+        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def __enter__(self):
+        self._http_post("/api/can/tunnel/open")
+        self._connect_tcp()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self._sock:
+                self._sock.close()
+        finally:
+            self._sock = None
+            try:
+                self._http_post("/api/can/tunnel/close")
+            except Exception:
+                pass
+
+    def send(self, msg):
+        sid = int(msg.arbitration_id) & 0x7FF
+        data = bytes(msg.data[:8])
+        dlc = len(data)
+        wire = CAN_TUNNEL_MAGIC + sid.to_bytes(2, "little") + bytes([dlc]) + data.ljust(8, b"\x00")
+        self._sock.sendall(wire)
+
+    def _fill_rx_queue(self) -> None:
+        while True:
+            while len(self._rx_buf) >= 2 and self._rx_buf[:2] != CAN_TUNNEL_MAGIC:
+                del self._rx_buf[0]
+            if len(self._rx_buf) < CAN_TUNNEL_FRAME_SIZE:
+                return
+            if self._rx_buf[:2] != CAN_TUNNEL_MAGIC:
+                continue
+            sid = int.from_bytes(self._rx_buf[2:4], "little")
+            dlc = min(self._rx_buf[4], 8)
+            payload = bytes(self._rx_buf[5:5 + dlc])
+            del self._rx_buf[:CAN_TUNNEL_FRAME_SIZE]
+            self._rx_queue.append(
+                can.Message(arbitration_id=sid, data=payload, is_extended_id=False)
+            )
+
+    def recv(self, timeout=None):
+        if not self._sock:
+            return None
+        if self._rx_queue:
+            return self._rx_queue.pop(0)
+        if timeout is not None:
+            self._sock.settimeout(timeout)
+        try:
+            chunk = self._sock.recv(4096)
+        except socket.timeout:
+            return None
+        if not chunk:
+            return None
+        self._rx_buf.extend(chunk)
+        self._fill_rx_queue()
+        if self._rx_queue:
+            return self._rx_queue.pop(0)
+        return None
+
+    def shutdown(self):
+        if self._sock:
+            self._sock.close()
+            self._sock = None
 
 
 def main() -> int:
@@ -138,10 +263,13 @@ def main() -> int:
     ap.add_argument("--node-id", type=int, required=True, help="Target node ID 1..126")
     ap.add_argument("--interface", default="socketcan", help="python-can interface (socketcan, slcan, ...)")
     ap.add_argument("--channel", default="can0", help="CAN channel / COM port")
+    ap.add_argument("--tunnel", default=None, help="Hub base URL for CAN tunnel (e.g. http://192.168.1.10)")
+    ap.add_argument("--ready-timeout", type=float, default=None,
+                    help="Seconds to wait for node READY (default 5, 20 when --tunnel)")
     ap.add_argument("--bitrate", type=int, default=500000)
     ap.add_argument("--fw-version", type=lambda x: int(x, 0), default=0x0100)
     ap.add_argument("--abort", action="store_true", help="Abort after READY (timeout test)")
-    ap.add_argument("--bad-crc", action="store_true", help="Send wrong CRC on END (rollback test)")
+    ap.add_argument("--bad-crc", action="store_true", help="Send wrong CRC on DONE (rollback test)")
     args = ap.parse_args()
 
     if args.node_id < 1 or args.node_id > 126:
@@ -154,31 +282,41 @@ def main() -> int:
         print("Invalid ESP32 image (expected magic 0xE9)", file=sys.stderr)
         return 1
 
-    bus = can.interface.Bus(channel=args.channel, interface=args.interface, bitrate=args.bitrate)
-    try:
+    ready_timeout = args.ready_timeout if args.ready_timeout is not None else (20.0 if args.tunnel else 5.0)
+
+    def run_with_bus(bus):
         if args.bad_crc:
             c = crc32(image)
-            send_begin(bus, args.node_id, len(image), c, args.fw_version)
-            wait_status(bus, args.node_id, FW_STATUS_READY)
-            seq = 0
-            offset = 0
+            send_init(bus, args.node_id, len(image))
+            offset = wait_ready(bus, args.node_id, timeout=ready_timeout)
             while offset < len(image):
-                n = min(FW_DATA_BYTES, len(image) - offset)
-                send_data(bus, args.node_id, seq, image[offset:offset + n])
-                offset += n
-                seq += 1
-            send_end(bus, args.node_id, c ^ 0xFFFFFFFF)
+                n = min(OTA_DATA_BYTES, len(image) - offset)
+                send_data(bus, args.node_id, offset, image[offset:offset + n])
+                offset = wait_ready(bus, args.node_id, timeout=ready_timeout)
+            send_done(bus, args.node_id, c ^ 0xFFFFFFFF)
             try:
-                wait_status(bus, args.node_id, FW_STATUS_COMPLETE, timeout=5.0)
-                print("Unexpected COMPLETE on bad CRC", file=sys.stderr)
-                return 2
+                opcode, _ = recv_node(bus, args.node_id, timeout=10.0)
+                if opcode == OTA_FLASH_COMPLETE:
+                    print("Unexpected COMPLETE on bad CRC", file=sys.stderr)
+                    return 2
             except (TimeoutError, RuntimeError):
                 print("Bad CRC rejected as expected")
                 return 0
-        run_ota(bus, args.node_id, image, args.fw_version, do_abort=args.abort)
+            print("Bad CRC rejected as expected")
+            return 0
+        run_ota(bus, args.node_id, image, args.fw_version, do_abort=args.abort,
+                ready_timeout=ready_timeout)
+        return 0
+
+    if args.tunnel:
+        with TunnelBus(args.tunnel) as bus:
+            return run_with_bus(bus)
+
+    bus = can.interface.Bus(channel=args.channel, interface=args.interface, bitrate=args.bitrate)
+    try:
+        return run_with_bus(bus)
     finally:
         bus.shutdown()
-    return 0
 
 
 if __name__ == "__main__":

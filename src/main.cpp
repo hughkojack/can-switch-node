@@ -137,7 +137,7 @@ static void on_input_click_flash(uint8_t input_id, uint8_t event_code) {
 #if defined(WS2812_ENABLE) && WS2812_ENABLE
 static void input_engine_reinit(void) {
   config_get_timing(&s_timing);
-  input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
+  input_engine_init(&cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
   input_engine_set_event_callback(on_input_click_flash);
 }
 #endif
@@ -370,7 +370,7 @@ void setup()
     config_get_timing(&s_timing);
     config_get_can_link_indicator_gpio(&can_link_indicator_gpio);
     Serial.printf("CAN link indicator GPIO=%u (0xFF=disabled)\n", (unsigned)can_link_indicator_gpio);
-    input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
+    input_engine_init(&cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
 
 #if defined(NODE_ROLE_MIN)
     node_ota_set_node_id(cfg.node_id);
@@ -407,10 +407,10 @@ void handle_can_messages() {
             // Hub-link: hub -> node traffic addressed to this node (incl. OTA firmware stream)
             if (target_id == cfg.node_id) {
                 if (msg_type == CAN_MSG_SENSOR_DATA || msg_type == CAN_MSG_NODE_CONFIG
-                    || msg_type == CAN_MSG_STATE_FEEDBACK || msg_type == CAN_MSG_FIRMWARE)
+                    || msg_type == CAN_MSG_STATE_FEEDBACK || msg_type == CAN_MSG_OTA_REMOTE)
                     s_last_hub_to_node_rx_ms = millis();
             }
-            if (msg_type == CAN_MSG_FIRMWARE && target_id == cfg.node_id && message.data_length_code >= 1) {
+            if (msg_type == CAN_MSG_OTA_REMOTE && target_id == cfg.node_id && message.data_length_code >= 3) {
 #if defined(NODE_ROLE_MIN)
                 node_ota_on_can_frame(message.data, message.data_length_code);
 #endif
@@ -442,7 +442,7 @@ void handle_can_messages() {
                         input_engine_reinit();
 #else
                         config_get_timing(&s_timing);
-                        input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
+                        input_engine_init(&cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
 #endif
                         Serial.printf("CONFIG: node_id set to %u\n", (unsigned)cfg.node_id);
                     }
@@ -466,7 +466,7 @@ void handle_can_messages() {
                         input_engine_reinit();
 #else
                         config_get_timing(&s_timing);
-                        input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
+                        input_engine_init(&cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
 #endif
                         Serial.printf("CONFIG: input[%u] -> id=%u mode=%u gpio=%u active_high=%u\n", (unsigned)idx, (unsigned)cfg.inputs[idx].input_id, (unsigned)cfg.inputs[idx].mode, (unsigned)cfg.input_gpio[idx], (unsigned)cfg.input_active_high[idx]);
                     }
@@ -479,7 +479,7 @@ void handle_can_messages() {
                         input_engine_reinit();
 #else
                         config_get_timing(&s_timing);
-                        input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
+                        input_engine_init(&cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
 #endif
                         Serial.printf("CONFIG: input_count set to %u\n", (unsigned)cfg.input_count);
                     }
@@ -498,7 +498,7 @@ void handle_can_messages() {
 #if defined(WS2812_ENABLE) && WS2812_ENABLE
                     input_engine_reinit();
 #else
-                    input_engine_init(cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
+                    input_engine_init(&cfg.node_id, cfg.inputs, cfg.input_count, &s_timing);
 #endif
                     Serial.printf("CONFIG: timing updated (part %u)\n", (unsigned)part);
                 } else if (cmd == CMD_FIND_ME) {
@@ -695,8 +695,8 @@ static void can_poll_task(void* arg) {
     last_heartbeat_ms = millis();
 
     for (;;) {
-        handle_can_messages();
         unsigned long now_ms = millis();
+        handle_can_messages();
 #if defined(NODE_ROLE_MIN)
         node_ota_service(now_ms);
         const bool ota_active = node_ota_is_active();
@@ -733,8 +733,7 @@ static void can_poll_task(void* arg) {
         }
 
 #if defined(NODE_ROLE_MIN)
-        // Send periodic HEARTBEAT every 15 seconds (skip while OTA receiving).
-        if (!ota_active) {
+        // Send periodic HEARTBEAT every 15 seconds (keep hub online during OTA too).
 #endif
         if (last_heartbeat_ms == 0) {
             last_heartbeat_ms = now_ms;
@@ -748,7 +747,8 @@ static void can_poll_task(void* arg) {
             }
         }
 #if defined(NODE_ROLE_MIN)
-        }
+        (void)ota_active;
+#endif
 #endif
         
         // Find-me: GPIO blink (non-WS2812 nodes only; WS2812 uses strip driver)

@@ -11,9 +11,9 @@ extern "C" {
 #define CAN_MSG_SENSOR_DATA   0x2   // Hub -> node: link keepalive (mechanical nodes; used for CAN link LED)
 #define CAN_MSG_NODE_CONFIG   0x3   // Hub -> node: configuration
 #define CAN_MSG_STATE_FEEDBACK 0x4  // Hub -> node: per-button brightness [b1,b2,b3,b4] 0-100 or 0xFF
-#define CAN_MSG_FIRMWARE       0x5  // Hub -> node: OTA firmware transfer
 #define CAN_MSG_NODE_ANNOUNCE 0x8   // Node -> hub: heartbeat/announce (reuse HEARTBEAT type)
-#define CAN_MSG_FIRMWARE_STATUS 0x9 // Node -> hub: OTA ACK/NACK/progress
+#define CAN_MSG_OTA_REMOTE    0xE   // Hub -> node: mcp-can-boot-style OTA
+#define CAN_MSG_OTA_NODE      0xF   // Node -> hub: OTA responses
 
 // Unconfigured node ID (127): hub detects new nodes; valid configured IDs 1..126
 #define NODE_ID_UNCONFIGURED  127
@@ -68,7 +68,7 @@ bool can_send_dim(uint8_t node_id, uint8_t input_id, uint8_t brightness_0_100);
 bool can_send_node_announce(uint8_t node_id, uint8_t node_type, uint8_t input_count);
 bool can_send_node_announce_ex(uint8_t node_id, uint8_t node_type, uint8_t input_count,
                                uint16_t fw_version, uint8_t ota_capable);
-bool can_send_firmware_status(uint8_t node_id, uint8_t status, uint16_t seq, uint32_t extra);
+bool can_send_ota_node(uint8_t node_id, const uint8_t data[8]);
 
 #ifdef __cplusplus
 }

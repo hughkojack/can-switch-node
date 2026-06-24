@@ -28,6 +28,7 @@ public:
   esp_err_t begin(spi_device_handle_t* spi_handle);
 
   esp_err_t stop();
+  bool isInitialized() const { return m_initialized; }
 
   esp_err_t write(can::FrameType extd, uint32_t identifier, uint8_t length, uint8_t *buffer);
   esp_err_t read(twai_message_t *ptr_message);

@@ -18,7 +18,7 @@ typedef struct {
 
 // Initialize engine with node_id and a config table.
 // timing_nvs: optional pointer to input_timing_t (from config_get_timing); if NULL use compile-time defaults.
-void input_engine_init(uint8_t node_id, const input_cfg_t* cfg, uint8_t cfg_count, const void* timing_nvs);
+void input_engine_init(const uint8_t* node_id_ptr, const input_cfg_t* cfg, uint8_t cfg_count, const void* timing_nvs);
 
 // Feed normalized "active" level into engine (true=active, false=inactive)
 // Engine will emit CAN messages according to mode.
