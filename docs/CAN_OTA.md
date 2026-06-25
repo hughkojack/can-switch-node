@@ -14,9 +14,13 @@ python tools/can_ota_bench.py --tunnel http://<hub-ip> --node-id 4 path/to/firmw
 
 3. Close the tunnel when finished (`POST /api/can/tunnel/close` or UI).
 
-## Known issues
+## WS2812 indicators (node_min_c3)
 
-- **WS2812 OTA indicators:** Start-of-transfer and end-of-success LED feedback still need a proper implementation (currently a placeholder find-me blink at session start; no success indication after `FLASH_COMPLETE`).
+| Phase | All 12 LEDs |
+|-------|-------------|
+| OTA in progress | Flash **red** (250 ms on/off) |
+| Failed / aborted | **Solid red** — single button click returns to night-light baseline |
+| Success | **Solid green** — single button click reboots into new firmware, or hub sends `CMD_REBOOT` |
 
 Wire format: TCP port **5250**, 13-byte frames: `0xCA 0xFE` + CAN ID (u16 LE) + DLC + 8 data bytes.
 

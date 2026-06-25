@@ -39,6 +39,7 @@ static volatile bool s_post_abort = false;
 static volatile uint8_t s_post_abort_reason = 0;
 static SemaphoreHandle_t s_mutex = nullptr;
 static portMUX_TYPE s_spinlock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_pending_reboot = false;
 
 static bool ota_process_pending_write(void);
 
@@ -132,12 +133,16 @@ static void ota_abort(uint8_t reason) {
   }
   s_update_part = nullptr;
   s_active = false;
+  s_pending_reboot = false;
   s_bytes_written = 0;
   s_running_crc = 0xFFFFFFFF;
   s_pending_write = false;
   s_pending_n = 0;
   ota_send_node(OTA_FLASH_ERROR, reason);
   ESP_LOGW(TAG, "abort reason=%u", (unsigned)reason);
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+  ws2812_request_ota_failed();
+#endif
 }
 
 static void ota_drain_flash_notifications(void) {
@@ -264,16 +269,15 @@ static bool ota_begin_session(uint32_t size) {
   ota_ensure_flash_task();
   ESP_LOGI(TAG, "OTA session ready size=%lu", (unsigned long)size);
   ota_send_node(OTA_FLASH_READY, 0);
-#if defined(WS2812_ENABLE) && WS2812_ENABLE
-  // TODO: OTA WS2812 feedback — start/end indicators are not reliable yet.
-  // Placeholder: 1-minute find-me amber blink at session start; no success indication on FLASH_COMPLETE.
-  ws2812_request_find_me(1);
-#endif
   return true;
 }
 
 bool node_ota_is_active(void) {
   return s_active;
+}
+
+bool node_ota_pending_reboot(void) {
+  return s_pending_reboot;
 }
 
 void node_ota_set_node_id(uint8_t node_id) {
@@ -318,7 +322,15 @@ void node_ota_on_can_frame(const uint8_t* data, uint8_t dlc) {
       ota_send_node(OTA_FLASH_READY, written);
       return;
     }
-    ota_begin_session(size);
+    s_pending_reboot = false;
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+    ws2812_request_ota_transfer();
+#endif
+    if (!ota_begin_session(size)) {
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+      ws2812_request_ota_failed();
+#endif
+    }
     return;
   }
 
@@ -364,6 +376,10 @@ void node_ota_on_can_frame(const uint8_t* data, uint8_t dlc) {
     portENTER_CRITICAL(&s_spinlock);
     s_pending_write = true;
     portEXIT_CRITICAL(&s_spinlock);
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+    if (current_written == 0)
+      ws2812_request_ota_transfer();
+#endif
     ota_kick_flash_write();
     return;
   }
@@ -430,8 +446,11 @@ void node_ota_on_can_frame(const uint8_t* data, uint8_t dlc) {
     s_update_part = nullptr;
     s_active = false;
     ota_send_node(OTA_FLASH_COMPLETE, final_written);
-    ESP_LOGI(TAG, "complete, waiting for hub reboot cmd");
-    // TODO: OTA WS2812 — add clear success indicator here (e.g. green flash) before hub CMD_REBOOT.
+    s_pending_reboot = true;
+    ESP_LOGI(TAG, "complete, click or hub reboot to run new image");
+#if defined(WS2812_ENABLE) && WS2812_ENABLE
+    ws2812_request_ota_success();
+#endif
   }
 }
 

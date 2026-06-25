@@ -22,7 +22,7 @@ extern "C" {
 #define OTA_DATA_BYTES_PER_FRAME  4
 #define OTA_SEGMENT_BYTES         4
 #define OTA_TRANSFER_BLOCK_BYTES  OTA_SEGMENT_BYTES
-#define FW_OTA_IDLE_TIMEOUT_MS   1800000
+#define FW_OTA_IDLE_TIMEOUT_MS   (2U * 60U * 1000U)
 
 #ifndef FW_VERSION
 #define FW_VERSION 0x0100
@@ -40,6 +40,7 @@ extern "C" {
 void node_ota_set_node_id(uint8_t node_id);
 void node_ota_set_poll_task(TaskHandle_t task);
 bool node_ota_is_active(void);
+bool node_ota_pending_reboot(void);
 void node_ota_on_can_frame(const uint8_t* data, uint8_t dlc);
 void node_ota_drain_notifications(void);
 void node_ota_service(unsigned long now_ms);
@@ -48,6 +49,7 @@ void node_ota_service(unsigned long now_ms);
 
 static inline void node_ota_set_node_id(uint8_t node_id) { (void)node_id; }
 static inline bool node_ota_is_active(void) { return false; }
+static inline bool node_ota_pending_reboot(void) { return false; }
 static inline void node_ota_on_can_frame(const uint8_t* data, uint8_t dlc) {
   (void)data; (void)dlc;
 }

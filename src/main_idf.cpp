@@ -47,6 +47,11 @@ static spi_device_handle_t s_can_spi_handle = nullptr;
 
 static void on_input_click_flash(uint8_t input_id, uint8_t event_code) {
   (void)input_id;
+  if (event_code == EVT_CLICK && node_ota_pending_reboot()) {
+    ESP_LOGI(TAG, "OTA success: click reboot");
+    esp_restart();
+    return;
+  }
   if (event_code == EVT_CLICK || event_code == EVT_DOUBLE_CLICK) {
 #if defined(WS2812_ENABLE) && WS2812_ENABLE
     ws2812_request_trigger_input_effect();

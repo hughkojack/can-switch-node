@@ -41,4 +41,16 @@ void ws2812_request_find_me(uint8_t duration_min) {
   ws2812_post_find_me(duration_min);
 }
 
+void ws2812_request_ota_transfer(void) {
+  ws2812_task_post_ota_transfer();
+}
+
+void ws2812_request_ota_failed(void) {
+  ws2812_task_post_ota_failed();
+}
+
+void ws2812_request_ota_success(void) {
+  ws2812_task_post_ota_success();
+}
+
 #endif

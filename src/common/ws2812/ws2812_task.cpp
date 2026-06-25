@@ -15,6 +15,7 @@
 static const char* TAG = "ws2812";
 
 #define NOW_MS() ((unsigned long)pdTICKS_TO_MS(xTaskGetTickCount()))
+#define OTA_BLINK_MS 250U
 
 enum class State : uint8_t {
   BootTest,
@@ -22,6 +23,9 @@ enum class State : uint8_t {
   Strobe,
   Chase,
   FindMe,
+  OtaTransfer,
+  OtaFailed,
+  OtaSuccess,
 };
 
 static QueueHandle_t s_cmd_queue = nullptr;
@@ -41,6 +45,13 @@ static uint8_t s_chase_step = 0;
 static unsigned long s_find_me_until_ms = 0;
 static unsigned long s_find_me_last_toggle_ms = 0;
 static bool s_find_me_on = false;
+static unsigned long s_ota_transfer_last_toggle_ms = 0;
+static bool s_ota_transfer_on = false;
+
+static bool in_ota_visual_state(void) {
+  return s_state == State::OtaTransfer || s_state == State::OtaFailed
+      || s_state == State::OtaSuccess;
+}
 
 static void load_effect_params_from_nvs(void) {
   ws2812_config_set_defaults(&s_cfg);
@@ -78,6 +89,8 @@ static void apply_baseline(void) {
 
 static void enter_baseline_state(void) {
   s_state = State::Baseline;
+  s_ota_transfer_last_toggle_ms = 0;
+  s_ota_transfer_on = false;
   apply_baseline();
 }
 
@@ -147,7 +160,37 @@ static void end_find_me(void) {
   ESP_LOGI(TAG, "find-me ended");
 }
 
+static void start_ota_transfer(void) {
+  cancel_transient();
+  s_state = State::OtaTransfer;
+  const unsigned long now = NOW_MS();
+  s_ota_transfer_last_toggle_ms = now;
+  s_ota_transfer_on = true;
+  fill_rgb(255, 0, 0);
+  ESP_LOGI(TAG, "OTA transfer (flash red)");
+}
+
+static void start_ota_failed(void) {
+  cancel_transient();
+  s_state = State::OtaFailed;
+  s_ota_transfer_last_toggle_ms = 0;
+  s_ota_transfer_on = false;
+  fill_rgb(255, 0, 0);
+  ESP_LOGI(TAG, "OTA failed (solid red)");
+}
+
+static void start_ota_success(void) {
+  cancel_transient();
+  s_state = State::OtaSuccess;
+  s_ota_transfer_last_toggle_ms = 0;
+  s_ota_transfer_on = false;
+  fill_rgb(0, 255, 0);
+  ESP_LOGI(TAG, "OTA success (solid green)");
+}
+
 static void apply_night_light(bool on, uint8_t brightness_0_100) {
+  if (in_ota_visual_state())
+    return;
   if (on && brightness_0_100 == 0) {
     ESP_LOGI(TAG, "night light on brightness=0, using minimum %u%%",
              (unsigned)WS2812_NIGHT_MIN_BRIGHTNESS);
@@ -166,10 +209,16 @@ static void handle_cmd(const Ws2812Cmd& cmd) {
       apply_night_light(cmd.u.night.on, cmd.u.night.brightness);
       break;
     case WS2812_CMD_TRIGGER_CLICK:
-      trigger_click();
+      if (s_state == State::OtaFailed) {
+        enter_baseline_state();
+        ESP_LOGI(TAG, "OTA failed cleared by click");
+      } else if (!in_ota_visual_state()) {
+        trigger_click();
+      }
       break;
     case WS2812_CMD_START_FIND_ME:
-      start_find_me(cmd.u.find_me_min);
+      if (!in_ota_visual_state())
+        start_find_me(cmd.u.find_me_min);
       break;
     case WS2812_CMD_SET_CLICK_EFFECT:
       s_cfg.click_effect = (cmd.u.click_effect != 0) ? 1 : 0;
@@ -196,6 +245,16 @@ static void handle_cmd(const Ws2812Cmd& cmd) {
     case WS2812_CMD_LOAD_NVS_BASELINE:
       load_effect_params_from_nvs();
       enter_baseline_state();
+      break;
+    case WS2812_CMD_OTA_TRANSFER:
+      if (s_state != State::OtaTransfer)
+        start_ota_transfer();
+      break;
+    case WS2812_CMD_OTA_FAILED:
+      start_ota_failed();
+      break;
+    case WS2812_CMD_OTA_SUCCESS:
+      start_ota_success();
       break;
     default:
       break;
@@ -277,6 +336,18 @@ static void tick_find_me(unsigned long now) {
     fill_rgb(0, 0, 0);
 }
 
+static void tick_ota_transfer(unsigned long now) {
+  if (s_ota_transfer_last_toggle_ms != 0
+      && (now - s_ota_transfer_last_toggle_ms) < OTA_BLINK_MS)
+    return;
+  s_ota_transfer_on = !s_ota_transfer_on;
+  s_ota_transfer_last_toggle_ms = now;
+  if (s_ota_transfer_on)
+    fill_rgb(255, 0, 0);
+  else
+    fill_rgb(0, 0, 0);
+}
+
 static void tick_state(unsigned long now) {
   switch (s_state) {
     case State::BootTest:
@@ -291,7 +362,12 @@ static void tick_state(unsigned long now) {
     case State::FindMe:
       tick_find_me(now);
       break;
+    case State::OtaTransfer:
+      tick_ota_transfer(now);
+      break;
     case State::Baseline:
+    case State::OtaFailed:
+    case State::OtaSuccess:
       break;
     default:
       break;
@@ -337,7 +413,7 @@ void ws2812_task_start(void) {
     ESP_LOGE(TAG, "queue create failed");
     return;
   }
-  xTaskCreate(ws2812_task, "ws2812", 12288, NULL, 1, NULL);
+  xTaskCreate(ws2812_task, "ws2812", 12288, NULL, 6, NULL);
 }
 
 void ws2812_task_post_set_night_light(bool on, uint8_t brightness_0_100) {
@@ -357,6 +433,24 @@ void ws2812_task_post_find_me(uint8_t duration_min) {
   Ws2812Cmd cmd = {};
   cmd.type = WS2812_CMD_START_FIND_ME;
   cmd.u.find_me_min = duration_min;
+  post_cmd(cmd);
+}
+
+void ws2812_task_post_ota_transfer(void) {
+  Ws2812Cmd cmd = {};
+  cmd.type = WS2812_CMD_OTA_TRANSFER;
+  post_cmd(cmd);
+}
+
+void ws2812_task_post_ota_failed(void) {
+  Ws2812Cmd cmd = {};
+  cmd.type = WS2812_CMD_OTA_FAILED;
+  post_cmd(cmd);
+}
+
+void ws2812_task_post_ota_success(void) {
+  Ws2812Cmd cmd = {};
+  cmd.type = WS2812_CMD_OTA_SUCCESS;
   post_cmd(cmd);
 }
 
