@@ -346,7 +346,7 @@ static void can_poll_task(void* arg) {
       }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(ota_active ? 1 : 10));
+    vTaskDelay(ota_active ? 0 : pdMS_TO_TICKS(10));
   }
 }
 

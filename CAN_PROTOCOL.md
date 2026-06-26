@@ -75,7 +75,11 @@ Node-paced OTA for mechanical nodes (`node_min_c3`). **Full guide:** [docs/CAN_O
 | `OTA_FLASH_ERROR` | `0x15` | Node → hub | Failure; byte 4 = reason |
 | `OTA_FLASH_ABORT` | `0x18` | Either | Cancel |
 
-**v2 strict stop-and-wait:** `OTA_SEGMENT_BYTES` = 4. Hub sends one `FLASH_DATA` frame (up to 4 bytes), then waits for `FLASH_READY` with **exact** offset `previous + len`. Node sends `READY` only after `esp_ota_write` completes; while a flash write is pending, incoming `DATA` is ignored (no busy `READY`). Offset mismatch → node sends `FLASH_DATA_ERR` with expected offset; hub resends from that offset. `READY` ahead of expected offset → hub aborts (desync). Tune segment size later via `OTA_SEGMENT_BYTES` (one `READY` per segment).
+**v2 strict stop-and-wait:** `OTA_SEGMENT_BYTES` = 4 per CAN frame (max payload in bytes 4–7).
+
+**v3 block transfer (faster):** `FLASH_INIT` byte 3 (`meta`) = block size per `FLASH_READY`: `0` → legacy 4 bytes; `16` or `32` → host sends that many bytes as consecutive `FLASH_DATA` frames (4 bytes each), node ACKs once. Bench default: `--block-size 16`.
+
+Hub sends one or more `FLASH_DATA` frames, then waits for `FLASH_READY` with **exact** offset `previous + len`. Node sends `READY` only after `esp_ota_write` completes; legacy mode may pipeline one extra segment (window 2). Offset mismatch → node sends `FLASH_DATA_ERR` with expected offset; hub resends from that offset. `READY` ahead of expected offset → hub aborts (desync).
 
 ## Node types
 

@@ -21,7 +21,9 @@ extern "C" {
 #define OTA_FLASH_ABORT      0x18
 #define OTA_DATA_BYTES_PER_FRAME  4
 #define OTA_SEGMENT_BYTES         4
-#define OTA_TRANSFER_BLOCK_BYTES  OTA_SEGMENT_BYTES
+/* FLASH_INIT byte 3: 0 = legacy 4-byte blocks; 16 or 32 = multi-frame block ACK */
+#define OTA_TRANSFER_BLOCK_BYTES  16
+#define OTA_BLOCK_BUF_MAX         32
 #define FW_OTA_IDLE_TIMEOUT_MS   (2U * 60U * 1000U)
 
 #ifndef FW_VERSION
